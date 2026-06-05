@@ -78,12 +78,16 @@ def _make_op_class_set(op_class_names):
 # ALU — 4 instances (one per dispatch lane).
 # Handles all integer arithmetic, logic, shift, compare, and branch insns.
 # CoralNPU latency = 1 cycle, fully pipelined (II = 1).
-_CoralNPU_ALU = MinorFU(
-    opClasses=_make_op_class_set(["IntAlu"]),
-    opLat=1,
-    issueLat=1,
-    timings=[MinorFUTiming(description="CoralNPU_ALU", srcRegsRelativeLats=[0])],
-)
+# Factory function: each call returns a NEW MinorFU object so that gem5 can
+# assign each pool slot a unique stats-group name (reusing the same object
+# across slots causes "Stats of the same group share the same name" panic).
+def _make_CoralNPU_ALU():
+    return MinorFU(
+        opClasses=_make_op_class_set(["IntAlu"]),
+        opLat=1,
+        issueLat=1,
+        timings=[MinorFUTiming(description="CoralNPU_ALU", srcRegsRelativeLats=[0])],
+    )
 
 # MLU — 1 shared pipelined multiplier (arbitrated across lanes).
 # CoralNPU latency = 3 cycles (E1=arbitrate, E2=33×33b multiply, E3=WB).
@@ -206,56 +210,58 @@ _CoralNPU_LSU = MinorFU(
 # VEC_ALU × 2 — integer arithmetic, logic, shift, compare, reduce, convert,
 #               mask ops, and vsetvl* configuration.
 # opLat=5 (3 overhead + 2 EX). II=1 (pipelined). srcRelLats=[2,2] → v-to-v=3cy.
-_CoralNPU_VEC_ALU = MinorFU(
-    opClasses=_make_op_class_set([
-        "SimdAdd",          # vadd, vsub, vrsub, vneg
-        "SimdAlu",          # vand, vor, vxor, vnot
-        "SimdCmp",          # vmseq, vmsne, vmsltu, vmslt, vmsleu, vmsle, vmsgtu, vmsgt
-        "SimdMisc",         # vmv.v.*, vmerge, vfirst, vmsbf, vmsif, vmsof, vid, viota
-        "SimdShift",        # vsll, vsrl, vsra, vnsrl, vnsra
-        "SimdShiftAcc",     # vssrl, vssra (shift with rounding)
-        "SimdReduceAlu",    # vredand, vredor, vredxor, vredmin/u, vredmax/u
-        "SimdReduceCmp",    # vminu, vmin, vmaxu, vmax reductions
-        "SimdCvt",          # vzext, vsext (zero/sign extend)
-        "SimdExt",          # vslideup, vslidedown, vslide1up, vslide1down, vrgather
-        "SimdConfig",       # vsetvl, vsetvli, vsetivli
-    ]),
-    opLat=5,
-    issueLat=1,
-    timings=[MinorFUTiming(
-        description="CoralNPU_VEC_ALU",
-        srcRegsRelativeLats=[2, 2],
-    )],
-)
+def _make_CoralNPU_VEC_ALU():
+    return MinorFU(
+        opClasses=_make_op_class_set([
+            "SimdAdd",          # vadd, vsub, vrsub, vneg
+            "SimdAlu",          # vand, vor, vxor, vnot
+            "SimdCmp",          # vmseq, vmsne, vmsltu, vmslt, vmsleu, vmsle, vmsgtu, vmsgt
+            "SimdMisc",         # vmv.v.*, vmerge, vfirst, vmsbf, vmsif, vmsof, vid, viota
+            "SimdShift",        # vsll, vsrl, vsra, vnsrl, vnsra
+            "SimdShiftAcc",     # vssrl, vssra (shift with rounding)
+            "SimdReduceAlu",    # vredand, vredor, vredxor, vredmin/u, vredmax/u
+            "SimdReduceCmp",    # vminu, vmin, vmaxu, vmax reductions
+            "SimdCvt",          # vzext, vsext (zero/sign extend)
+            "SimdExt",          # vslideup, vslidedown, vslide1up, vslide1down, vrgather
+            "SimdConfig",       # vsetvl, vsetvli, vsetivli
+        ]),
+        opLat=5,
+        issueLat=1,
+        timings=[MinorFUTiming(
+            description="CoralNPU_VEC_ALU",
+            srcRegsRelativeLats=[2, 2],
+        )],
+    )
 
 # VEC_MUL × 2 — integer multiply/MAC, dot-product, float arithmetic.
 # opLat=5 (3 overhead + 2 EX). II=1 (pipelined). srcRelLats=[2,2] → v-to-v=3cy.
-_CoralNPU_VEC_MUL = MinorFU(
-    opClasses=_make_op_class_set([
-        "SimdMult",             # vmul, vmulh, vmulhu, vmulhsu
-        "SimdMultAcc",          # vmacc, vnmsac, vmadd, vnmsub
-        "SimdAddAcc",           # vsadd, vsaddu, vssub, vssubu (saturating)
-        "SimdReduceAdd",        # vredsum, vwredsum, vwredsumu
-        "SimdDotProd",          # vdot (if available)
-        # Floating-point (routes through RVV co-processor's MUL pipeline)
-        "SimdFloatAdd",         # vfadd, vfsub, vfrsub
-        "SimdFloatAlu",         # vfsgnj, vfsgnjn, vfsgnjx, vfmin, vfmax
-        "SimdFloatCmp",         # vmfeq, vmfne, vmflt, vmfle, vmfgt, vmfge
-        "SimdFloatCvt",         # vfcvt.*, vfwcvt.*, vfncvt.*
-        "SimdFloatMisc",        # vfmerge, vfmv.*
-        "SimdFloatMult",        # vfmul, vfwmul
-        "SimdFloatMultAcc",     # vfmacc, vfnmacc, vfmsac, vfnmsac, vfmadd, vfnmadd
-        "SimdFloatReduceAdd",   # vfredosum, vfredusum, vfwredosum, vfwredusum
-        "SimdFloatReduceCmp",   # vfredmin, vfredmax
-        "SimdFloatExt",         # vfslide*, vfrgather
-    ]),
-    opLat=5,
-    issueLat=1,
-    timings=[MinorFUTiming(
-        description="CoralNPU_VEC_MUL",
-        srcRegsRelativeLats=[2, 2],
-    )],
-)
+def _make_CoralNPU_VEC_MUL():
+    return MinorFU(
+        opClasses=_make_op_class_set([
+            "SimdMult",             # vmul, vmulh, vmulhu, vmulhsu
+            "SimdMultAcc",          # vmacc, vnmsac, vmadd, vnmsub
+            "SimdAddAcc",           # vsadd, vsaddu, vssub, vssubu (saturating)
+            "SimdReduceAdd",        # vredsum, vwredsum, vwredsumu
+            "SimdDotProd",          # vdot (if available)
+            # Floating-point (routes through RVV co-processor's MUL pipeline)
+            "SimdFloatAdd",         # vfadd, vfsub, vfrsub
+            "SimdFloatAlu",         # vfsgnj, vfsgnjn, vfsgnjx, vfmin, vfmax
+            "SimdFloatCmp",         # vmfeq, vmfne, vmflt, vmfle, vmfgt, vmfge
+            "SimdFloatCvt",         # vfcvt.*, vfwcvt.*, vfncvt.*
+            "SimdFloatMisc",        # vfmerge, vfmv.*
+            "SimdFloatMult",        # vfmul, vfwmul
+            "SimdFloatMultAcc",     # vfmacc, vfnmacc, vfmsac, vfnmsac, vfmadd, vfnmadd
+            "SimdFloatReduceAdd",   # vfredosum, vfredusum, vfwredosum, vfwredusum
+            "SimdFloatReduceCmp",   # vfredmin, vfredmax
+            "SimdFloatExt",         # vfslide*, vfrgather
+        ]),
+        opLat=5,
+        issueLat=1,
+        timings=[MinorFUTiming(
+            description="CoralNPU_VEC_MUL",
+            srcRegsRelativeLats=[2, 2],
+        )],
+    )
 
 # VEC_DIV × 1 — integer divide/remainder and float divide/sqrt.
 # Non-pipelined: EX ≈ 32 cy + 3 cy overhead = 35 cy total.
@@ -279,21 +285,21 @@ _CoralNPU_VEC_DIV = MinorFU(
 
 CoralNPU_FUPool = MinorFUPool(funcUnits=[
     # ── Scalar units ────────────────────────────────────────────────────────
-    _CoralNPU_ALU,      # lane 0
-    _CoralNPU_ALU,      # lane 1
-    _CoralNPU_ALU,      # lane 2
-    _CoralNPU_ALU,      # lane 3
-    _CoralNPU_MLU,      # 1 shared scalar multiplier
-    _CoralNPU_DVU,      # 1 scalar divider (lane-0-only not enforced)
-    _CoralNPU_FPU,      # 1 scalar FPU (slot-0-only not enforced)
-    _CoralNPU_LSU,      # 1 LSU slot — handles scalar AND vector memory
-    _CoralNPU_CSR,      # System / CSR / serialising
+    _make_CoralNPU_ALU(),   # lane 0  — each call returns a distinct object
+    _make_CoralNPU_ALU(),   # lane 1
+    _make_CoralNPU_ALU(),   # lane 2
+    _make_CoralNPU_ALU(),   # lane 3
+    _CoralNPU_MLU,          # 1 shared scalar multiplier
+    _CoralNPU_DVU,          # 1 scalar divider (lane-0-only not enforced)
+    _CoralNPU_FPU,          # 1 scalar FPU (slot-0-only not enforced)
+    _CoralNPU_LSU,          # 1 LSU slot — handles scalar AND vector memory
+    _CoralNPU_CSR,          # System / CSR / serialising
     # ── RVV co-processor units ──────────────────────────────────────────────
-    _CoralNPU_VEC_ALU,  # RVV ALU instance 0  (NUM_ALU=2 in RTL)
-    _CoralNPU_VEC_ALU,  # RVV ALU instance 1
-    _CoralNPU_VEC_MUL,  # RVV MUL instance 0  (NUM_MUL=2 in RTL)
-    _CoralNPU_VEC_MUL,  # RVV MUL instance 1
-    _CoralNPU_VEC_DIV,  # RVV DIV instance 0  (NUM_DIV=1 in RTL)
+    _make_CoralNPU_VEC_ALU(),   # RVV ALU instance 0  (NUM_ALU=2 in RTL)
+    _make_CoralNPU_VEC_ALU(),   # RVV ALU instance 1
+    _make_CoralNPU_VEC_MUL(),   # RVV MUL instance 0  (NUM_MUL=2 in RTL)
+    _make_CoralNPU_VEC_MUL(),   # RVV MUL instance 1
+    _CoralNPU_VEC_DIV,          # RVV DIV instance 0  (NUM_DIV=1 in RTL)
 ])
 
 
@@ -373,8 +379,6 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     branchPred = BranchPredictor(
         conditionalBranchPred=LocalBP(
             localPredictorSize=256,
-            localHistoryTableSize=256,
             localCtrBits=2,
-            numThreads=1,
         )
     )

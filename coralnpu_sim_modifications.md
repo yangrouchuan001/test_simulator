@@ -42,6 +42,11 @@
     - 10.1 [Scalar timing accuracy](#101-scalar-timing-accuracy)
     - 10.2 [RVV timing accuracy (Level 2)](#102-rvv-timing-accuracy-level-2)
     - 10.3 [Known gaps table](#103-known-gaps-table)
+11. [Build Fixes — Errors Encountered and Resolved](#11-build-fixes--errors-encountered-and-resolved)
+    - 11.1 [ISA parser: "instruction format Unknown not defined"](#111-isa-parser-instruction-format-unknown-not-defined)
+    - 11.2 [Linker: undefined reference to getLE / setLE](#112-linker-undefined-reference-to-getle--setle)
+    - 11.3 [AttributeError: Invalid assignment for LocalBP parameter localHistoryTableSize](#113-attributeerror-invalid-assignment-for-localbp-parameter-localhistorytablesize)
+    - 11.4 [Panic: Stats of the same group share the same name `opClasses`](#114-panic-stats-of-the-same-group-share-the-same-name-opclasses)
 
 ---
 
@@ -49,9 +54,7 @@
 
 | File | Type | Purpose |
 |------|------|---------|
-| `src/arch/riscv/isa/formats/coralnpu.isa` | **New** | ISA format for `mpause` instruction |
-| `src/arch/riscv/isa/formats/formats.isa` | **Modified** | Include coralnpu.isa in the ISA build |
-| `src/arch/riscv/isa/decoder.isa` | **Modified** | Decode `mpause` (custom-0 opcode 0x0000000B) |
+| `src/arch/riscv/isa/decoder.isa` | **Modified** | Decode `mpause` via existing `SystemOp` format (custom-0, `0x0000000B`) |
 | `src/dev/coralnpu/uart_console.hh` | **New** | `UartConsole` SimObject header |
 | `src/dev/coralnpu/uart_console.cc` | **New** | `UartConsole` implementation — prints bytes on write |
 | `src/dev/coralnpu/UartConsole.py` | **New** | gem5 Python param class for `UartConsole` |
@@ -60,7 +63,7 @@
 | `configs/coralnpu/coralnpu_cpu.py` | **New** | `CoralNPUMinorCPU` class — scalar + RVV FU pool |
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr` and wires `UartConsole` |
 
-Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required three small edits to the RISC-V ISA description files. The printf support required a minimal new C++ SimObject (`UartConsole`).
+Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
 ---
 
@@ -82,38 +85,36 @@ before syncing with RTL).
 | RD, RS1, RS2, FUNCT7 | remaining | all zero |
 | **Full 32-bit word** | | **`0x0000000B`** |
 
-### 2.1 `formats/coralnpu.isa` (new)
+### 2.1 `formats/coralnpu.isa`
 
-`src/arch/riscv/isa/formats/coralnpu.isa`
+No separate format file is needed.  `mpause` reuses the existing `SystemOp`
+format (defined in `formats/standard.isa`) with an empty C++ code body — the
+same pattern used by `ecall`, `ebreak`, `fence`, and `wfi`.
 
-Defines the `CoralNPUOp` ISA format. The ISA build system expands this into a
-`Mpause` C++ class that inherits from `SystemOp` (already in `standard.hh`).
+A standalone `CoralNPUOp` format was attempted first but caused the ISA parser
+to fail before `unknown.isa` was included (gem5 ISA `{{ }}` blocks do not allow
+`//` comments at the outer scope; they are stripped as ISA-level comments and
+can leave malformed Python).  Using the pre-existing `SystemOp` format avoids
+the problem entirely.
 
-```
-flags applied: IsNonSpeculative, IsSerializeAfter
-execute body:  empty → returns NoFault (no-op in software simulation)
-disassembly:   "mpause"
-```
+### 2.2 `formats/formats.isa` (unchanged)
 
-### 2.2 `formats/formats.isa` (modified)
-
-```diff
-  ##include "m5ops.isa"
-+ ##include "coralnpu.isa"   ← new
-  ##include "unknown.isa"
-```
+No modification required — `SystemOp` is already included via
+`##include "standard.isa"` earlier in the formats list.
 
 ### 2.3 `decoder.isa` (modified)
 
 Inside `0x3: decode OPCODE5 {}`, immediately before the `0x03:` (FENCE) block:
 
 ```diff
-+ // CoralNPU custom-0: mpause  (encoding 0x0000000B)
-+ 0x02: CoralNPUOp::mpause();
++ 0x02: SystemOp::mpause({{ }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
 +
   0x03: decode FUNCT3 {
       format FenceOp {
 ```
+
+`{{ }}` is the empty C++ execute body — `SystemOp` returns `NoFault` by default.
+`No_OpClass` maps `mpause` to the `System` functional unit (same as `ecall`).
 
 ---
 
@@ -286,6 +287,20 @@ public:
 ```
 
 #### `src/dev/coralnpu/uart_console.cc`
+
+```cpp
+#include "dev/coralnpu/uart_console.hh"
+
+#include <cstdio>
+
+#include "mem/packet.hh"
+#include "mem/packet_access.hh"   // required: defines getLE/setLE inline bodies
+```
+
+`mem/packet_access.hh` **must** be included directly in the `.cc` file.
+`io_device.hh` only includes `mem/tport.hh`; it does not pull in
+`packet_access.hh`, so the compiler never sees the inline template definitions
+for `getLE`/`setLE` without this explicit include (see §11.2).
 
 Key logic in `write()`:
 
@@ -720,6 +735,295 @@ Level 2 provides **approximate** vector timing, not exact cycle-accurate matchin
 | 4 | Stripmining (1 front-end → 4 issues) | 1 front-end → 1 issue | IPC overestimate for SIMD | Medium: custom decoder |
 | 5 | DVU variable latency (32–34 cy) | Fixed 34 cy worst-case | Slight pessimism on divide | Low: `TimingExpr` |
 | 6 | L0 I-cache (1 KB inside Fetch) | L1I only | Minor fetch stall difference | Low: add 2nd cache level |
-| 7 | Static branch predictor | `LocalBP` (256-entry table) | Small misprediction difference | Low: patch pred/ |
+| 7 | Static branch predictor | `LocalBP` (256-entry, 2-bit counters) | Small misprediction difference | Low: patch pred/ |
 | 8 | C-extension encoding reclaimed | RVC still decoded | Wrong for RVC bytes in firmware | Low: reject 16-bit in decoder |
 | 9 | Vector ROB (8-entry, independent) | Shared scalar ROB path | Vector backpressure overestimated | High: separate SimObject |
+
+---
+
+## 11. Build Fixes — Errors Encountered and Resolved
+
+This section records the two build errors that appeared during development and
+how each was diagnosed and fixed.
+
+---
+
+### 11.1 ISA parser: "instruction format Unknown not defined"
+
+**Full error**
+
+```
+In file included /src/arch/riscv/isa/decoder.isa:4:
+instruction format "Unknown" not defined.
+scons: *** [build/RISCV/arch/riscv/generated/decoder.cc] Explicit exit, status 1
+```
+
+**Root cause**
+
+The original implementation defined a custom `CoralNPUOp` format in a new file
+`src/arch/riscv/isa/formats/coralnpu.isa` and included it from `formats.isa`
+between `m5ops.isa` and `unknown.isa`:
+
+```
+##include "m5ops.isa"
+##include "coralnpu.isa"   ← new file
+##include "unknown.isa"
+```
+
+Inside `coralnpu.isa`, the `def format CoralNPUOp() {{ ... }}` block contained
+`//` comment lines at the outer Python scope:
+
+```
+def format CoralNPUOp() {{
+    // Code executed when the instruction fires.   ← ISA-level comment
+    code = '''
+        // No architectural state is modified.     ← string content (OK)
+    '''
+    ...
+}};
+```
+
+gem5's ISA preprocessor strips `//` text **before** passing the block to the
+Python interpreter — this is intentional for ISA-level comments. The outer
+`// ...` lines were stripped from the Python code, leaving the format body
+syntactically incomplete. The ISA parser aborted while processing
+`coralnpu.isa`, so `unknown.isa` was never reached.  Because `Unknown` (defined
+in `unknown.isa`) was never registered, any use of it as a decode default
+produced the error.
+
+**Diagnosis**
+
+The error points to `decoder.isa` because `Unknown::unknown()` is the default
+in the top-level decode block (`decode QUADRANT default Unknown::unknown()`).
+The `decoder.isa` itself was not the problem — the problem was that `Unknown`
+was never defined due to the aborted `formats.isa` parse.
+
+**Fix**
+
+Dropped the custom format file entirely. `mpause` reuses the pre-existing
+`SystemOp` format (defined in `formats/standard.isa`, already included) with
+an empty C++ code body — the identical pattern used by `ecall`, `ebreak`, and
+`wfi`:
+
+```diff
+- // in formats/formats.isa
+- ##include "coralnpu.isa"          ← removed
+
+  // in decoder.isa (inside 0x3: decode OPCODE5 {})
+- 0x02: CoralNPUOp::mpause();
++ 0x02: SystemOp::mpause({{ }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
+```
+
+**Rule for future ISA format files**
+
+Inside `def format Name() {{ ... }}`, use Python `#` for comments, not `//`.
+`//` is valid only at ISA scope (outside `{{ }}` blocks) where it is
+preprocessed as an ISA-level comment.
+
+---
+
+### 11.2 Linker: undefined reference to `getLE` / `setLE`
+
+**Full error**
+
+```
+/usr/bin/ld: build/RISCV/dev/coralnpu/uart_console.o:
+  uart_console.cc:26: undefined reference to
+    `unsigned char gem5::Packet::getLE<unsigned char>() const'
+/usr/bin/ld: build/RISCV/dev/coralnpu/uart_console.o:
+  uart_console.cc:17: undefined reference to
+    `void gem5::Packet::setLE<unsigned long>(unsigned long)'
+collect2: error: ld returned 1 exit status
+```
+
+**Root cause**
+
+`Packet::getLE<T>()` and `Packet::setLE<T>()` are declared in `mem/packet.hh`
+but their **inline template bodies** are defined in a separate header,
+`mem/packet_access.hh`:
+
+```
+mem/packet.hh      →  T getLE() const;          (declaration only)
+mem/packet_access.hh → inline T Packet::getLE()  (body — must be included)
+```
+
+`uart_console.cc` originally included only `dev/coralnpu/uart_console.hh`,
+which transitively pulls in `dev/io_device.hh`. Checking `io_device.hh`
+reveals it includes only `mem/tport.hh`, `params/*.hh`, and
+`sim/clocked_object.hh` — **not** `mem/packet_access.hh`. Because the inline
+bodies were never visible during compilation, the compiler emitted external
+references for the template specialisations instead of generating them inline,
+and the linker could not resolve them.
+
+**Diagnosis**
+
+Every other device that uses `getLE`/`setLE` (e.g. `dev/isa_fake.cc`) includes
+`mem/packet_access.hh` explicitly in the `.cc` file, independent of what the
+header chain provides. Comparing `isa_fake.cc`'s include list against
+`uart_console.cc`'s include list revealed the missing include.
+
+**Fix**
+
+Added the two missing includes directly in `uart_console.cc`:
+
+```diff
+  #include "dev/coralnpu/uart_console.hh"
+  #include <cstdio>
++ #include "mem/packet.hh"
++ #include "mem/packet_access.hh"
+```
+
+**Rule for future device implementations**
+
+Always include `mem/packet_access.hh` explicitly in any `.cc` file that calls
+`pkt->getLE<T>()`, `pkt->setLE<T>()`, `pkt->getBE<T>()`, or `pkt->setBE<T>()`.
+Do not rely on transitive inclusion through device or port headers.
+
+---
+
+### 11.3 AttributeError: Invalid assignment for LocalBP parameter `localHistoryTableSize`
+
+**Full error**
+
+```
+AttributeError: Invalid assignment for Class LocalBP with parameter localHistoryTableSize
+At:
+  configs/coralnpu/coralnpu_cpu.py(374): CoralNPUMinorCPU
+```
+
+**Root cause**
+
+The `CoralNPUMinorCPU` branch predictor was configured with four `LocalBP`
+parameters copied from a different gem5 version's API:
+
+```python
+branchPred = BranchPredictor(
+    conditionalBranchPred=LocalBP(
+        localPredictorSize=256,
+        localHistoryTableSize=256,   # ← does not exist in this build
+        localCtrBits=2,
+        numThreads=1,                # ← does not exist in this build
+    )
+)
+```
+
+In this gem5 version, `LocalBP` (defined in
+`src/cpu/pred/BranchPredictor.py`) exposes only two parameters:
+
+| Parameter | Type | Default | Meaning |
+|-----------|------|---------|---------|
+| `localPredictorSize` | `Unsigned` | 2048 | Number of PHT entries |
+| `localCtrBits` | `Unsigned` | 2 | Saturating counter width |
+
+`localHistoryTableSize` belongs to `TournamentBP`, not `LocalBP`. `numThreads`
+is inherited from a parent class and is not settable at construction in this
+version.
+
+**Fix**
+
+Removed the two invalid parameters from the `LocalBP` instantiation in
+`configs/coralnpu/coralnpu_cpu.py`:
+
+```diff
+  branchPred = BranchPredictor(
+      conditionalBranchPred=LocalBP(
+          localPredictorSize=256,
+-         localHistoryTableSize=256,
+          localCtrBits=2,
+-         numThreads=1,
+      )
+  )
+```
+
+The 256-entry PHT with 2-bit counters is retained — this matches the CoralNPU
+scalar core's small local predictor. The history table size in `LocalBP` is
+implicitly determined by `localPredictorSize`; there is no separate knob.
+
+---
+
+### 11.4 Panic: Stats of the same group share the same name `opClasses`
+
+**Full error**
+
+```
+src/base/stats/group.cc:121: panic: panic condition
+  statGroups.find(name) != statGroups.end() occurred:
+  Stats of the same group share the same name `opClasses`.
+Memory Usage: 687772 KBytes
+Program aborted at tick 0
+```
+
+**Root cause**
+
+The FU pool was defined by placing the **same Python SimObject** in multiple
+pool slots:
+
+```python
+# WRONG — same object referenced N times
+_CoralNPU_ALU = MinorFU(opClasses=..., opLat=1, ...)
+
+CoralNPU_FUPool = MinorFUPool(funcUnits=[
+    _CoralNPU_ALU,   # slot 0 \
+    _CoralNPU_ALU,   # slot 1  }- all three point to the same C++ object
+    _CoralNPU_ALU,   # slot 2 /
+    ...
+    _CoralNPU_VEC_ALU,  # RVV ALU slot 0 \- same object in two slots
+    _CoralNPU_VEC_ALU,  # RVV ALU slot 1 /
+    ...
+])
+```
+
+In gem5, each Python `SimObject` instance maps to exactly one C++ object.
+When the same Python object appears twice in the `funcUnits` list, gem5
+instantiates the underlying C++ `MinorFU` object once and adds it to the
+stats hierarchy twice — with the same parent-relative name `opClasses` both
+times. The stats subsystem detects the collision and calls `panic`.
+
+**Diagnosis**
+
+The backtrace shows `statistics::Group::addStatGroup` → `panic`. The stat
+group name `opClasses` is registered by the `MinorFU` C++ constructor.
+The collision occurs at `m5.instantiate()` (tick 0) because that is when
+Python SimObjects are realised into C++ objects.
+
+**Fix**
+
+Replaced the repeated singleton objects with **factory functions** that return
+a fresh `MinorFU` instance on each call:
+
+```diff
+- _CoralNPU_ALU = MinorFU(opClasses=..., opLat=1, ...)
++ def _make_CoralNPU_ALU():
++     return MinorFU(opClasses=..., opLat=1, ...)
+
+- _CoralNPU_VEC_ALU = MinorFU(opClasses=..., opLat=5, ...)
++ def _make_CoralNPU_VEC_ALU():
++     return MinorFU(opClasses=..., opLat=5, ...)
+
+- _CoralNPU_VEC_MUL = MinorFU(opClasses=..., opLat=5, ...)
++ def _make_CoralNPU_VEC_MUL():
++     return MinorFU(opClasses=..., opLat=5, ...)
+
+  CoralNPU_FUPool = MinorFUPool(funcUnits=[
+-     _CoralNPU_ALU, _CoralNPU_ALU, _CoralNPU_ALU, _CoralNPU_ALU,
++     _make_CoralNPU_ALU(), _make_CoralNPU_ALU(),
++     _make_CoralNPU_ALU(), _make_CoralNPU_ALU(),
+      _CoralNPU_MLU, _CoralNPU_DVU, _CoralNPU_FPU,
+      _CoralNPU_LSU, _CoralNPU_CSR,
+-     _CoralNPU_VEC_ALU, _CoralNPU_VEC_ALU,
++     _make_CoralNPU_VEC_ALU(), _make_CoralNPU_VEC_ALU(),
+-     _CoralNPU_VEC_MUL, _CoralNPU_VEC_MUL,
++     _make_CoralNPU_VEC_MUL(), _make_CoralNPU_VEC_MUL(),
+      _CoralNPU_VEC_DIV,
+  ])
+```
+
+Single-instance FUs (`_CoralNPU_MLU`, `_CoralNPU_DVU`, `_CoralNPU_FPU`,
+`_CoralNPU_LSU`, `_CoralNPU_CSR`, `_CoralNPU_VEC_DIV`) appear only once in
+the pool so they are unaffected and remain as module-level objects.
+
+**Rule for future FU pool definitions**
+
+Never place the same Python `MinorFU` object in more than one pool slot.
+Use a factory function (`def _make_X(): return MinorFU(...)`) for every FU
+type that needs more than one instance.

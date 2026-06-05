@@ -2,7 +2,8 @@
 
 #include <cstdio>
 
-#include "base/trace.hh"
+#include "mem/packet.hh"
+#include "mem/packet_access.hh"
 
 namespace gem5 {
 

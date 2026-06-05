@@ -1333,10 +1333,7 @@ decode QUADRANT default Unknown::unknown() {
             }
         }
 
-        // CoralNPU custom-0 opcode space (RISC-V bits[6:2]=0x02, opcode byte=0x0B).
-        // mpause encoding: 0x0000000B (rd=0, rs1=0, rs2=0, funct3=0, funct7=0).
-        // Acts as a no-op in standalone simulation; marks RTL co-sim sync points.
-        0x02: CoralNPUOp::mpause();
+        0x02: SystemOp::mpause({{ }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
 
         0x03: decode FUNCT3 {
             format FenceOp {
