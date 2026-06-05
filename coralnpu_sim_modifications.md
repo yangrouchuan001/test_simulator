@@ -1074,30 +1074,40 @@ allocation is gem5's OS-emulation stack.
 
 **Fix**
 
-Automatically fill the gap between DTCM end and ExtMem start with a
-`SimpleMemory` in `build_system()`:
+Compute all memory ranges — including the gap fill — upfront and set
+`system.mem_ranges` in a **single assignment** before the `System` object
+is constructed.  Re-assigning `system.mem_ranges` after initial set does not
+reliably propagate through gem5's `VectorParam`, so appending later is not
+a valid approach.
 
 ```python
 from m5.util.convert import toMemorySize   # added to imports
 
-# In build_system(), after DTCM is wired up and before ExtMem:
+# At the top of build_system(), before System() is constructed:
 _dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
-if _dtcm_end < ext_mem_start:
-    _gap_size = ext_mem_start - _dtcm_end
+_has_gap  = _dtcm_end < ext_mem_start
+
+_mem_ranges = [
+    AddrRange(start=itcm_start, size=args.itcm_size),
+    AddrRange(start=dtcm_start, size=args.dtcm_size),
+]
+if _has_gap:
+    _mem_ranges.append(AddrRange(start=_dtcm_end,
+                                 size=ext_mem_start - _dtcm_end))
+_mem_ranges.append(AddrRange(start=ext_mem_start, size=args.ext_mem_size))
+
+system = System()
+system.mem_ranges = _mem_ranges   # single assignment — includes gap
+
+# Later, after the bus is created, wire the backing SimpleMemory:
+if _has_gap:
     proc_mem = SimpleMemory(
-        range=AddrRange(start=_dtcm_end, size=_gap_size),
-        latency="1ns",
-        bandwidth="32GB/s",
+        range=AddrRange(start=_dtcm_end, size=ext_mem_start - _dtcm_end),
+        latency="1ns", bandwidth="32GB/s",
     )
     system.proc_mem = proc_mem
     system.membus.mem_side_ports = proc_mem.port
-    system.mem_ranges = list(system.mem_ranges) + [
-        AddrRange(start=_dtcm_end, size=_gap_size)
-    ]
 ```
-
-The region is also appended to `system.mem_ranges` so that the SE memory
-pool includes it.
 
 **Why this does not waste host RAM**
 

@@ -135,16 +135,31 @@ def build_system(args):
     dtcm_start    = int(args.dtcm_start,    16)
     ext_mem_start = int(args.ext_mem_start, 16)
 
+    # Compute DTCM end and the gap to ExtMem.
+    # gem5 SE mode places the RV32 user stack at 0x7FFFFFFF (base, 64 MiB max)
+    # and heap/mmap from ELF-end up to 0x40000000.  Both fall in the gap
+    # between DTCM end and ExtMem start.  Include the gap in mem_ranges now
+    # so the SE memory pool has backing for those allocations.
+    # (system.mem_ranges must be set in a single assignment — re-assignment
+    # after the fact does not reliably propagate through gem5's VectorParam.)
+    _dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
+    _has_gap  = _dtcm_end < ext_mem_start
+
+    _mem_ranges = [
+        AddrRange(start=itcm_start, size=args.itcm_size),
+        AddrRange(start=dtcm_start, size=args.dtcm_size),
+    ]
+    if _has_gap:
+        _mem_ranges.append(AddrRange(start=_dtcm_end,
+                                     size=ext_mem_start - _dtcm_end))
+    _mem_ranges.append(AddrRange(start=ext_mem_start, size=args.ext_mem_size))
+
     system = System()
     system.clk_domain = SrcClockDomain(
         clock=args.freq,
         voltage_domain=VoltageDomain(),
     )
-    system.mem_ranges = [
-        AddrRange(start=itcm_start,    size=args.itcm_size),
-        AddrRange(start=dtcm_start,    size=args.dtcm_size),
-        AddrRange(start=ext_mem_start, size=args.ext_mem_size),
-    ]
+    system.mem_ranges = _mem_ranges
 
     # ── CPU ──────────────────────────────────────────────────────────────────
     if args.cpu == "atomic":
@@ -206,18 +221,9 @@ def build_system(args):
     system.membus.mem_side_ports = dtcm.port
 
     # ── Process auxiliary memory — SE stack / heap gap fill ──────────────────
-    # gem5 SE mode places the RV32 user process stack at 0x7FFFFFFF (base)
-    # and the heap/mmap region from the ELF image end up to 0x40000000.
-    # Both fall in the gap between DTCM end and ExtMem start, which has no
-    # backing memory declared.  The SE memory pool cannot allocate pages there
-    # and panics with "Out of memory" at tick 0.
-    #
-    # Fix: fill the entire gap with a SimpleMemory so all SE allocations
-    # in that range succeed.  SimpleMemory uses mmap(MAP_ANONYMOUS) internally
-    # so host RAM is only consumed for pages that are actually touched —
-    # declaring a 2 GB gap does not reserve 2 GB of host RAM.
-    _dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
-    if _dtcm_end < ext_mem_start:
+    # Range already declared in system.mem_ranges above; create the backing
+    # SimpleMemory object here and wire it to the bus.
+    if _has_gap:
         _gap_size = ext_mem_start - _dtcm_end
         proc_mem = SimpleMemory(
             range=AddrRange(start=_dtcm_end, size=_gap_size),
@@ -226,9 +232,6 @@ def build_system(args):
         )
         system.proc_mem = proc_mem
         system.membus.mem_side_ports = proc_mem.port
-        system.mem_ranges = list(system.mem_ranges) + [
-            AddrRange(start=_dtcm_end, size=_gap_size)
-        ]
 
     # ── External memory (AXI bus model) ──────────────────────────────────────
     # 50 ns models typical AXI bus + off-chip SRAM/DDR latency.
