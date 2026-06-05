@@ -57,6 +57,7 @@ from m5.objects import (
     UartConsole,
     VoltageDomain,
 )
+from m5.util.convert import toMemorySize
 
 from coralnpu.coralnpu_cpu import CoralNPUMinorCPU
 
@@ -203,6 +204,31 @@ def build_system(args):
     )
     system.dtcm = dtcm
     system.membus.mem_side_ports = dtcm.port
+
+    # ── Process auxiliary memory — SE stack / heap gap fill ──────────────────
+    # gem5 SE mode places the RV32 user process stack at 0x7FFFFFFF (base)
+    # and the heap/mmap region from the ELF image end up to 0x40000000.
+    # Both fall in the gap between DTCM end and ExtMem start, which has no
+    # backing memory declared.  The SE memory pool cannot allocate pages there
+    # and panics with "Out of memory" at tick 0.
+    #
+    # Fix: fill the entire gap with a SimpleMemory so all SE allocations
+    # in that range succeed.  SimpleMemory uses mmap(MAP_ANONYMOUS) internally
+    # so host RAM is only consumed for pages that are actually touched —
+    # declaring a 2 GB gap does not reserve 2 GB of host RAM.
+    _dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
+    if _dtcm_end < ext_mem_start:
+        _gap_size = ext_mem_start - _dtcm_end
+        proc_mem = SimpleMemory(
+            range=AddrRange(start=_dtcm_end, size=_gap_size),
+            latency="1ns",
+            bandwidth="32GB/s",
+        )
+        system.proc_mem = proc_mem
+        system.membus.mem_side_ports = proc_mem.port
+        system.mem_ranges = list(system.mem_ranges) + [
+            AddrRange(start=_dtcm_end, size=_gap_size)
+        ]
 
     # ── External memory (AXI bus model) ──────────────────────────────────────
     # 50 ns models typical AXI bus + off-chip SRAM/DDR latency.

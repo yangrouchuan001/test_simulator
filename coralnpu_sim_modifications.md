@@ -47,6 +47,7 @@
     - 11.2 [Linker: undefined reference to getLE / setLE](#112-linker-undefined-reference-to-getle--setle)
     - 11.3 [AttributeError: Invalid assignment for LocalBP parameter localHistoryTableSize](#113-attributeerror-invalid-assignment-for-localbp-parameter-localhistorytablesize)
     - 11.4 [Panic: Stats of the same group share the same name `opClasses`](#114-panic-stats-of-the-same-group-share-the-same-name-opclasses)
+    - 11.5 [Fatal: Out of memory, please increase size of physical memory](#115-fatal-out-of-memory-please-increase-size-of-physical-memory)
 
 ---
 
@@ -1027,3 +1028,88 @@ the pool so they are unaffected and remain as module-level objects.
 Never place the same Python `MinorFU` object in more than one pool slot.
 Use a factory function (`def _make_X(): return MinorFU(...)`) for every FU
 type that needs more than one instance.
+
+---
+
+### 11.5 Fatal: Out of memory, please increase size of physical memory
+
+**Full error**
+
+```
+src/sim/mem_pool.cc:100: fatal: Out of memory, please increase size of physical memory.
+Memory Usage: 689824 KBytes
+Program aborted at tick 0
+```
+
+**Root cause**
+
+gem5 SE mode performs its own OS-emulation memory management on top of the
+declared `system.mem_ranges`.  For a 32-bit RISC-V process, gem5 places the
+user stack and heap at fixed virtual addresses regardless of the firmware's
+linker script:
+
+| Region | Address range | Size |
+|--------|--------------|------|
+| Stack base | `0x7FFFFFFF` (growing downward) | 64 MiB max |
+| Stack bottom | `0x40000000` | — |
+| Heap / mmap | ELF image end → `0x40000000` | variable |
+
+With the user's memory map:
+
+| Region | Start | End |
+|--------|-------|-----|
+| ITCM | `0x00000000` | `0x000FFFFF` |
+| DTCM | `0x00100000` | `0x001FFFFF` |
+| *(gap)* | `0x00200000` | `0x7FFFFFFF` |
+| ExtMem | `0x80000000` | `0x9FFFFFFF` |
+
+The entire gem5 SE stack and heap (`0x00200000–0x7FFFFFFF`) falls in the
+unmapped gap between DTCM and ExtMem.  When `m5.instantiate()` tries to
+allocate physical pages for the user stack, the memory pool finds no pool
+covering that range and calls `fatal("Out of memory")`.
+
+This is a property of gem5 SE mode, not of the firmware itself.  The
+firmware's own stack (set in the linker script) is within DTCM; the failing
+allocation is gem5's OS-emulation stack.
+
+**Fix**
+
+Automatically fill the gap between DTCM end and ExtMem start with a
+`SimpleMemory` in `build_system()`:
+
+```python
+from m5.util.convert import toMemorySize   # added to imports
+
+# In build_system(), after DTCM is wired up and before ExtMem:
+_dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
+if _dtcm_end < ext_mem_start:
+    _gap_size = ext_mem_start - _dtcm_end
+    proc_mem = SimpleMemory(
+        range=AddrRange(start=_dtcm_end, size=_gap_size),
+        latency="1ns",
+        bandwidth="32GB/s",
+    )
+    system.proc_mem = proc_mem
+    system.membus.mem_side_ports = proc_mem.port
+    system.mem_ranges = list(system.mem_ranges) + [
+        AddrRange(start=_dtcm_end, size=_gap_size)
+    ]
+```
+
+The region is also appended to `system.mem_ranges` so that the SE memory
+pool includes it.
+
+**Why this does not waste host RAM**
+
+`SimpleMemory` backs its address space with `mmap(MAP_ANONYMOUS | MAP_NORESERVE)`.
+The host kernel does not commit physical pages until they are first touched.
+For the user's default gap (`0x200000`–`0x80000000` ≈ 2 GB), only the pages
+that the gem5 SE stack, heap, and loader actually access are committed — in
+practice a few MiB for a simple firmware binary.
+
+**Rule**
+
+When declaring a non-contiguous CoralNPU memory map with a gap between DTCM
+and ExtMem, gem5 SE mode always needs backing memory across the entire
+32-bit user address space below ExtMem.  The gap-fill is now automatic in
+`coralnpu_se.py` and requires no user action.
