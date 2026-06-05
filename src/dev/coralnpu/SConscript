@@ -1,0 +1,9 @@
+# -*- mode:python -*-
+
+Import('*')
+
+if not env['CONF']['USE_RISCV_ISA']:
+    Return()
+
+SimObject('UartConsole.py', sim_objects=['UartConsole'], tags=['riscv isa'])
+Source('uart_console.cc', tags=['riscv isa'])

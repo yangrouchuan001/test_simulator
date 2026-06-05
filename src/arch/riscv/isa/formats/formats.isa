@@ -49,5 +49,8 @@
 // Pseudo operations
 ##include "m5ops.isa"
 
+// CoralNPU custom instructions (mpause and future custom-0 encodings)
+##include "coralnpu.isa"
+
 // Include the unknown
 ##include "unknown.isa"

@@ -1,0 +1,31 @@
+// -*- mode:c++ -*-
+//
+// CoralNPU custom instruction ISA format definitions.
+//
+// Adds the `mpause` instruction (custom-0 encoding, opcode[6:0]=0x0B,
+// funct3=0x0, all register fields zero) which CoralNPU firmware uses as
+// an RTL co-simulation synchronisation point.  In standalone gem5
+// simulation the instruction is a architectural no-op: it does not modify
+// any register, advances the PC normally, and returns NoFault.
+//
+// Encoding:   0000000_00000_00000_000_00000_0001011  (0x0000000B)
+// Opcode:     custom-0  (RISC-V reserved custom opcode space, bits[6:2]=0x02)
+// Base class: SystemOp  (serialising, non-speculative)
+
+def format CoralNPUOp() {{
+    // Code executed when the instruction fires.
+    // mpause is intentionally a no-op in software simulation: it exists
+    // only to delimit RTL co-simulation checkpoints.
+    code = '''
+        // CoralNPU mpause: RTL co-simulation sync point.
+        // No architectural state is modified.
+    '''
+
+    iop = InstObjParams(name, Name, 'SystemOp', code,
+                        ['IsNonSpeculative', 'IsSerializeAfter'])
+
+    header_output  = BasicDeclare.subst(iop)
+    decoder_output = BasicConstructor.subst(iop)
+    decode_block   = BasicDecode.subst(iop)
+    exec_output    = BasicExecute.subst(iop)
+}};
