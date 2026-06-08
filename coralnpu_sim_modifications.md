@@ -58,6 +58,7 @@
     - 11.13 [Panic: Page table fault at 0xfffffffffffffff8 (RV32 UART MMIO sign-extension + missing identity-map)](#1113-panic-page-table-fault-at-0xfffffffffffffff8-rv32-uart-mmio-sign-extension--missing-identity-map)
     - 11.14 [Fatal: xbar unable to find destination for \[0xffffffe0:0x100000000\] (UART device covers < one cache line)](#1114-fatal-xbar-unable-to-find-destination-for-0xffffffe00x100000000-uart-device-covers--one-cache-line)
     - 11.15 [Missing output and stats — simulation exits via SIGTRAP when firmware uses ebreak as exit](#1115-missing-output-and-stats--simulation-exits-via-sigtrap-when-firmware-uses-ebreak-as-exit)
+    - 11.16 [printf output missing in MinorCPU timing mode — MMIO identity-map created cacheable, stores absorbed by L1D cache](#1116-printf-output-missing-in-minorcpu-timing-mode--mmio-identity-map-created-cacheable-stores-absorbed-by-l1d-cache)
 
 ---
 
@@ -75,7 +76,7 @@
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, and `system.cache_line_size=32` |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | Pass RV32-masked `vaddr` (not raw `req->getVaddr()`) to `GenericPageTableFault` so fixupFault receives the 32-bit UART address |
-| `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware |
+| `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
 
@@ -2367,6 +2368,88 @@ The GDB branch (`trapToGdb`) is unchanged: when a remote GDB is attached,
 
 **Files modified:**
 - `src/arch/riscv/faults.cc`
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+## §11.16 — printf output missing in MinorCPU timing mode — MMIO identity-map created cacheable, stores absorbed by L1D cache
+
+**Symptom**
+
+After all prior fixes (§11.12–§11.15) the simulation runs to completion and
+`stats.txt` is written, but **no firmware `printf` output** appears on the
+terminal when using `--cpu minor`.  Running with `--cpu atomic` shows the
+expected output.
+
+**Root cause**
+
+The MMIO identity-map introduced in §11.13 (`fixupFault`) called:
+
+```cpp
+_ownerProcess->map(vpage_start, vpage_start, _pageBytes);
+//                                                        ↑ cacheable=true (default)
+```
+
+`Process::map()` passes this through as `EmulationPageTable::MappingFlags(0)`,
+which the TLB turns into a normal cacheable TLB entry.
+
+When MinorCPU's pipeline commits `sb char, 0xFFFFFFF8` (UART TX store):
+
+1. The TLB translates `0xFFFFFFF8` via the cacheable mapping → `PA=0xFFFFFFF8`.
+2. The store enters the **L1D cache** as a normal write-allocate fill.
+3. The L1D cache line `[0xFFFFFFC0, 0xFFFFFFE0)` is allocated in the cache and
+   marked dirty.
+4. The dirty line is only written back to the bus when it is evicted (by cache
+   pressure) or at the end of simulation.  In practice, for small firmware that
+   fits in L1D, the line is **never evicted** — the `putchar` call inside
+   `UartConsole::write()` never fires during the run.
+
+AtomicSimpleCPU has no L1D cache: stores go directly from the CPU to the bus
+→ `UartConsole::write()` → `putchar()`, so atomic mode works correctly.
+
+**Fix — `src/sim/mem_state.cc`**
+
+Pass `cacheable=false` when mapping MMIO pages.  The `Request::UNCACHEABLE`
+flag set by the TLB causes the CPU to bypass all caches for these accesses and
+send the request directly to the bus.
+
+```cpp
+// BEFORE (§11.13 original):
+_ownerProcess->map(vpage_start, vpage_start, _pageBytes);
+
+// AFTER (§11.16):
+_ownerProcess->map(vpage_start, vpage_start, _pageBytes,
+                   /*cacheable=*/false);
+```
+
+Full context in `fixupFault`:
+
+```cpp
+// Identity-map pages for MMIO device access (e.g. UART, RTC).
+// cacheable=false: MMIO writes must bypass the L1D cache and reach the
+// device immediately; a cacheable mapping would absorb stores silently.
+{
+    Addr vpage_start = roundDown(vaddr, _pageBytes);
+    _ownerProcess->map(vpage_start, vpage_start, _pageBytes,
+                       /*cacheable=*/false);
+    return true;
+}
+```
+
+**Why atomic mode is unaffected**
+
+`AtomicSimpleCPU` issues atomic memory requests that ignore the cacheable flag —
+all accesses go directly to the device regardless.  The bug only manifests with
+a timing CPU + cache hierarchy.
+
+**Files modified:**
+- `src/sim/mem_state.cc`
 
 **Rebuild required:**
 

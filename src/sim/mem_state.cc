@@ -463,9 +463,12 @@ MemState::fixupFault(Addr vaddr)
     // The RV32 TLB already masks the address to 32 bits before reaching
     // here, so this receives e.g. 0xFFFFFFF8 rather than the sign-extended
     // 0xfffffffffffffff8.  If no device claims the PA the bus will fault.
+    // cacheable=false: MMIO writes must bypass the L1D cache and reach the
+    // device immediately; a cacheable mapping would absorb stores silently.
     {
         Addr vpage_start = roundDown(vaddr, _pageBytes);
-        _ownerProcess->map(vpage_start, vpage_start, _pageBytes);
+        _ownerProcess->map(vpage_start, vpage_start, _pageBytes,
+                           /*cacheable=*/false);
         return true;
     }
 }
