@@ -40,6 +40,7 @@
 #include "cpu/base.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Faults.hh"
+#include "base/cprintf.hh"
 #include "sim/debug.hh"
 #include "sim/full_system.hh"
 #include "sim/sim_exit.hh"
@@ -321,7 +322,7 @@ BreakpointFault::invokeSE(ThreadContext *tc, const StaticInstPtr &inst)
     if (! tc->getSystemPtr()->trapToGdb(GDBSignal::TRAP, tc->contextId()) ) {
         // ebreak used as bare-metal exit: terminate the simulation cleanly
         // so that atexit handlers (stats dump) run normally.
-        exitSimLoop("ebreak", 0);
+        exitSimLoop(csprintf("ebreak @ %#x", tc->pcState().instAddr()), 0);
     }
 }
 

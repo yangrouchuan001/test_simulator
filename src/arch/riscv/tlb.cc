@@ -599,12 +599,17 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
          * need to ignore the upper bits beyond 32 bits.
          */
         Addr vaddr = getValidAddr(req->getVaddr(), tc, mode);
-        Addr paddr;
 
-        if (!p->pTable->translate(vaddr, paddr))
+        const EmulationPageTable::Entry *pte = p->pTable->lookup(vaddr);
+        if (!pte)
             return std::make_shared<GenericPageTableFault>(vaddr);
 
-        req->setPaddr(paddr);
+        req->setPaddr(p->pTable->pageOffset(vaddr) + pte->paddr);
+
+        // Propagate the Uncacheable flag so MMIO stores bypass the L1D cache
+        // and reach the device immediately (e.g. UartConsole MMIO writes).
+        if (pte->flags & EmulationPageTable::Uncacheable)
+            req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
 
         return NoFault;
     }

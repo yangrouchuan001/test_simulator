@@ -75,7 +75,7 @@
 | `configs/coralnpu/coralnpu_cpu.py` | **New** | `CoralNPUMinorCPU` class — scalar + RVV FU pool |
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, and `system.cache_line_size=32` |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
-| `src/arch/riscv/tlb.cc` | **Modified** | Pass RV32-masked `vaddr` (not raw `req->getVaddr()`) to `GenericPageTableFault` so fixupFault receives the 32-bit UART address |
+| `src/arch/riscv/tlb.cc` | **Modified** | (§11.13) Pass RV32-masked `vaddr` to `GenericPageTableFault`; (§11.16) SE translate path uses `pTable->lookup()` to read `Uncacheable` flag and sets `Request::UNCACHEABLE` so MMIO stores bypass the L1D cache |
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
@@ -2450,6 +2450,82 @@ a timing CPU + cache hierarchy.
 
 **Files modified:**
 - `src/sim/mem_state.cc`
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+## §11.16 amendment — RISC-V SE TLB does not propagate `Uncacheable` flag to request
+
+**Symptom**
+
+Even after §11.16 (`cacheable=false` in `fixupFault`), firmware `printf` output
+still does not appear in MinorCPU timing mode.
+
+**Root cause**
+
+`EmulationPageTable::translate(Addr vaddr, Addr &paddr)` only returns the
+physical address — it discards the `Uncacheable` flag stored in the page table
+entry.  The RISC-V SE TLB path was:
+
+```cpp
+if (!p->pTable->translate(vaddr, paddr))
+    return std::make_shared<GenericPageTableFault>(vaddr);
+req->setPaddr(paddr);
+// ← Uncacheable flag never read, Request::UNCACHEABLE never set
+```
+
+So despite `mem_state.cc` creating the mapping with `cacheable=false`, the
+resulting `Request` objects have no `UNCACHEABLE` flag.  The L1D cache treats
+every access to `0xFFFFFFF8` as an ordinary cacheable store and absorbs it.
+
+**Fix — `src/arch/riscv/tlb.cc` SE translate path**
+
+Replace the `translate(vaddr, paddr)` call with `pTable->lookup()` which returns
+the full `Entry` (physical address + flags), then propagate `UNCACHEABLE`:
+
+```cpp
+// BEFORE:
+Addr vaddr = getValidAddr(req->getVaddr(), tc, mode);
+Addr paddr;
+
+if (!p->pTable->translate(vaddr, paddr))
+    return std::make_shared<GenericPageTableFault>(vaddr);
+
+req->setPaddr(paddr);
+
+return NoFault;
+
+// AFTER:
+Addr vaddr = getValidAddr(req->getVaddr(), tc, mode);
+
+const EmulationPageTable::Entry *pte = p->pTable->lookup(vaddr);
+if (!pte)
+    return std::make_shared<GenericPageTableFault>(vaddr);
+
+req->setPaddr(p->pTable->pageOffset(vaddr) + pte->paddr);
+
+// Propagate the Uncacheable flag so MMIO stores bypass the L1D cache
+// and reach the device immediately (e.g. UartConsole MMIO writes).
+if (pte->flags & EmulationPageTable::Uncacheable)
+    req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+
+return NoFault;
+```
+
+Normal heap/stack pages have `flags=0`, so the `if` is never taken for regular
+accesses — their behavior is unchanged.  Only the UART/MMIO page (mapped via
+`fixupFault` with `cacheable=false`, which stores `EmulationPageTable::Uncacheable`)
+gets `UNCACHEABLE|STRICT_ORDER` on its requests, causing the L1D to forward the
+store directly to the bus → `UartConsole::write()` → `putchar()`.
+
+**Files modified:**
+- `src/arch/riscv/tlb.cc`
 
 **Rebuild required:**
 
