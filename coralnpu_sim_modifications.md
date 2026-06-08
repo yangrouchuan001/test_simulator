@@ -52,6 +52,9 @@
     - 11.7 [warn: Ignoring write to miscreg INSTRET / panic: Page table fault at 0x2000e4](#117-warn-ignoring-write-to-miscreg-instret--panic-page-table-fault-when-accessing-virtual-address-0x2000e4)
     - 11.8 [Simulation stall — only 10 instructions committed in 378M cycles (IsSerializeAfter on CSR instructions)](#118-simulation-stall--only-10-instructions-committed-in-378-million-cycles-isserializeafter-on-csr-instructions)
     - 11.9 [Panic: Page table fault when accessing virtual address in TCM range (fixupFault conf-only check)](#119-panic-page-table-fault-when-accessing-virtual-address-in-tcm-range-fixupfault-conf-only-check)
+    - 11.10 [Panic: mstatus is not accessible in 0 (AtomicSimpleCPU missing privilege_mode_set="M")](#1110-panic-mstatus-is-not-accessible-in-0-atomicsimplecpu-missing-privilege_mode_setm)
+    - 11.11 [Illegal instruction machInst with vill=1 after vsetvli (missing branchTarget propagation)](#1111-illegal-instruction-machinst-with-vill1-after-vsetvli-missing-branchtarget-propagation)
+    - 11.12 [Illegal instruction / instBits=0 at mid-block PC (cache_line_size vs fetch request size mismatch)](#1112-illegal-instruction--instbits0-at-mid-block-pc-cache_line_size-vs-fetch-request-size-mismatch)
 
 ---
 
@@ -66,7 +69,8 @@
 | `src/dev/coralnpu/SConscript` | **New** | Build registration for the UART device |
 | `configs/coralnpu/__init__.py` | **New** | Python package marker |
 | `configs/coralnpu/coralnpu_cpu.py` | **New** | `CoralNPUMinorCPU` class — scalar + RVV FU pool |
-| `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr` and wires `UartConsole` |
+| `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, and `system.cache_line_size=32` |
+| `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -1734,4 +1738,283 @@ panics correctly.
 ```bash
 cd /orange/ZSP/home/cn2095/test_simulator
 scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+### 11.10 Panic: mstatus is not accessible in 0 (AtomicSimpleCPU missing privilege_mode_set="M")
+
+**Error observed**
+
+```
+src/arch/riscv/faults.cc:299: panic: Illegal instruction 0x1000010030002573
+    at pc (0x78=>0x7c).(0=>1): mstatus is not accessible in 0
+```
+
+Occurs only when running with `--cpu atomic`.  The Minor-CPU path did not
+exhibit this error because the Minor-CPU ISA definition in `coralnpu_cpu.py`
+already carries `privilege_mode_set="M"`.
+
+**Root cause**
+
+`coralnpu_se.py` created the `RiscvAtomicSimpleCPU` with an inline ISA:
+
+```python
+cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False)]
+```
+
+Without `privilege_mode_set="M"`, the CPU resets to PRV_U (user mode, mode 0).
+`process.cc::RiscvProcess32::initState()` then calls
+`tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U)` which stays at mode 0.  The
+firmware CSR `csrr a0, mstatus` at PC=0x78 requires M-mode privilege; the
+RISC-V ISA layer rejects it with "not accessible in 0".
+
+**Fix**
+
+`configs/coralnpu/coralnpu_se.py`, line ~168:
+
+```diff
+-        cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False)]
++        cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False,
++                             privilege_mode_set="M")]
+```
+
+This matches the `privilege_mode_set="M"` already present in the Minor-CPU
+ISA (`coralnpu_cpu.py`) and in the `process.cc` conditional that skips
+the `PRV_U` assignment when `misa.rvu == 0`.
+
+**Files modified:** `configs/coralnpu/coralnpu_se.py`
+
+**Rebuild required:** No — Python-only change; takes effect on next run.
+
+---
+
+### 11.11 Illegal instruction machInst with vill=1 after vsetvli (missing branchTarget propagation)
+
+**Error observed**
+
+```
+src/arch/riscv/faults.cc:299: panic: Illegal instruction 0x1000010000000000
+    at pc (0xc74=>0xc76).(0=>1): immediate = 0
+```
+
+The upper 32 bits of the `ExtMachInst` show `enable_zcd=1` (bit 60) and
+`vill=1` (bit 40); the lower 32 bits (`instBits`) are `0x00000000`.  The
+decoder interprets 0x0000 as a compressed `C.ADDI4SPN` with imm=0, which is
+illegal per the C extension.
+
+**Root cause**
+
+In `src/arch/riscv/isa/formats/vector_conf.isa`, the `VConfOp` format
+macro generates a `branchTarget()` method **only for `vsetivli`**:
+
+```python
+if "vsetivli" in name:           # ← does NOT match "vsetvli"
+    branchTargetTemplate = eval(branch_class)
+    exec_output = VConfExecute.subst(iop) + branchTargetTemplate.subst(iop)
+else:
+    exec_output = VConfExecute.subst(iop)   # vsetvli takes this path
+```
+
+`vsetivli` has `IsDirectControl`: its `branchTarget()` pre-computes both
+the new vtype and new vl from immediates, stores them in a cloned PCState
+with `new_vconf=true`, and redirects fetch to PC+4.  The decoder, after a
+pipeline flush, calls `decode(PCStateBase&)` with `squashed=true`, reads
+vtype from the PCState (finding the freshly-computed correct vtype), and
+packs it into the upper bits of every subsequent `ExtMachInst`.
+
+`vsetvli` has `IsIndirectControl` and was **missing a `branchTarget()`
+implementation** (the name `VSetVliBranchTarget` appeared in `decoder.isa`
+but the template was never defined and the format macro never invoked it).
+After a pipeline flush caused by a misprediction or an explicit pipeline
+drain, the decoder reads the initial reset-state PCState vtype
+`_vtype = (1ULL << 63)` — which has `vill=1`.  All subsequent instructions
+decoded in that stream get `vill=1` packed into their `ExtMachInst` upper
+bits.  For scalar instructions this is harmless, but in certain pipeline
+timing scenarios the `machInst.instBits` can be zero (cold I-cache or
+decoder state after a squash), leading to the `C.ADDI4SPN(imm=0)` panic.
+
+**Fix — three file changes**
+
+**1. `src/arch/riscv/isa/formats/vector_conf.isa`**
+
+a) Add `VSetVliDeclare` template (declares `branchTarget()` for vsetvli):
+
+```cpp
+def template VSetVliDeclare {{
+    class %(class_name)s : public %(base_class)s {
+      private:
+        %(reg_idx_arr_decl)s;
+        VTYPE getNewVtype(VTYPE, VTYPE) const;
+        uint32_t getNewVL(uint32_t, uint32_t, uint32_t,
+                          uint64_t, uint64_t) const;
+      public:
+        %(class_name)s(ExtMachInst machInst, uint32_t elen, uint32_t vlen);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        std::unique_ptr<PCStateBase> branchTarget(
+                const PCStateBase &branch_pc) const override;
+        using StaticInst::branchTarget;
+        using %(base_class)s::generateDisassembly;
+    };
+}};
+```
+
+b) Add `VSetVliBranchTarget` template (implements the method):
+
+```cpp
+def template VSetVliBranchTarget {{
+    std::unique_ptr<PCStateBase>
+    %(class_name)s::branchTarget(const PCStateBase &branch_pc) const
+    {
+        auto &rpc = branch_pc.as<RiscvISA::PCState>();
+        // vsetvli: vtype encoded in zimm11; vl depends on rs1 (unknown
+        // at decode time) — propagate correct vtype only, keep current vl.
+        VTYPE new_vtype = getNewVtype(rpc.vtype(), zimm11);
+        std::unique_ptr<PCState> npc(dynamic_cast<PCState*>(rpc.clone()));
+        npc->set(rvSext(npc->pc() + 4));
+        npc->new_vconf(true);
+        npc->vtype(new_vtype);
+        return npc;
+    }
+}};
+```
+
+c) Fix the `VConfOp` format condition to invoke `branchTarget` for both
+`vsetvli` and `vsetivli`:
+
+```diff
+-    if "vsetivli" in name:
++    if "vsetivli" in name or name == "vsetvli":
+```
+
+**2. `src/arch/riscv/isa/decoder.isa`** (line ~5982)
+
+Change vsetvli's declare class from `VSetVlDeclare` (no `branchTarget`) to
+the new `VSetVliDeclare`:
+
+```diff
+-                    }}, VSetVlDeclare, VSetVliBranchTarget
++                    }}, VSetVliDeclare, VSetVliBranchTarget
+```
+
+**Why `vsetvl` is unchanged**
+
+`vsetvl rd, rs1, rs2` gets its requested vtype from register `rs2`.  That
+register value is unavailable at decode time, so a decode-time
+`branchTarget()` cannot compute the correct new vtype.  `vsetvl` keeps
+`VSetVlDeclare` (no `branchTarget`).  The `vl` propagation limitation
+also applies to `vsetvli`: the new vl depends on `rs1` and is not
+pre-computed; the PCState vl is kept unchanged and only the vtype is
+propagated.
+
+**Safety rationale**
+
+Adding `branchTarget()` to `vsetvli` changes only decode-time branch
+prediction and PCState vtype propagation — it does not modify the execute-
+time behaviour.  After `vsetvli` commits, MISCREG_VL and MISCREG_VTYPE
+are updated normally by `execute()`.  Vector instructions that need the
+precise new vl always read MISCREG_VL at execute time, not from
+`machInst.vl`.
+
+**Files modified:**
+- `src/arch/riscv/isa/formats/vector_conf.isa`
+- `src/arch/riscv/isa/decoder.isa`
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+### 11.12 Illegal instruction / instBits=0 at mid-block PC (cache_line_size vs fetch request size mismatch)
+
+**Error observed**
+
+```
+src/arch/riscv/faults.cc:299: panic: Illegal instruction 0x1000010000000000
+    at pc (0xc74=>0xc76).(0=>1): immediate = 0
+```
+
+The lower 32 bits of `ExtMachInst` are `0x00000000`; the decoder interprets
+`0x0000` as `C.ADDI4SPN` with imm=0, which is illegal per the RISC-V C
+extension.  The instruction actually present at PC=0xc74 in the ELF is
+`0xfe040113` (`addi sp, s0, -32`) — the binary is correct.
+
+**Root cause**
+
+MinorCPU fetch1 aligns fetch addresses to `System::cache_line_size` boundaries
+(default 64 bytes) but issues memory requests of `fetch1LineSnapWidth` bytes
+(32 bytes in the CoralNPU config).  When a branch jumps to a PC that falls in
+the **second** 32-byte half of a 64-byte aligned block, the timeline is:
+
+1. Branch to PC=0xc74 causes an `UnpredictedBranch` stream change.
+2. fetch1 aligns: `lineBaseAddr = 0xc74 & ~63 = 0xc40`.
+3. First request: 32 bytes from `0xc40`.  Response covers `[0xc40, 0xc5f]`.
+4. fetch2 receives the response with `lineBaseAddr=0xc40`, `lineWidth=32`.
+5. fetch2 computes `inputIndex = PC − lineBaseAddr = 0xc74 − 0xc40 = 52`.
+6. `52 > lineWidth(32)` → `memcpy(decoder->moreBytesPtr(), line + 52, 4)`
+   reads **past the end** of the 32-byte buffer.
+7. The destination (`moreBytesPtr`) is filled with zeros (uninitialized
+   memory past the allocation).
+8. `moreBytes()` stores `machInst.instBits = 0x00000000`.
+9. Decoder produces `C.ADDI4SPN(imm=0)` → panic.
+
+**Confirmed by debug trace** (`--debug-flags=Fetch,Decode`):
+
+```
+system.cpu.fetch2: Setting new PC value: (0xc74=>0xc78).(0=>1)
+    inputIndex: 0x34  lineBaseAddr: 0xc40  lineWidth: 0x20
+system.cpu.decoder: Requesting bytes 0x00000000 from address 0xc74
+system.cpu.decoder: Decoding instruction 0x00000000 at address 0xc74
+system.cpu.decoder: Decode: Decoded c_addi4spn instruction: 0x1000010000000000
+```
+
+`inputIndex = 0x34 = 52`, `lineWidth = 0x20 = 32`: the overread is exact.
+
+**Fix**
+
+Set `System::cache_line_size` to match `fetch1LineSnapWidth` (32 bytes) so
+fetch1 aligns to 32-byte boundaries.  With 32-byte alignment,
+`lineBaseAddr = 0xc74 & ~31 = 0xc60` and `inputIndex = 0xc74 − 0xc60 = 20 < 32`.
+The `memcpy` always reads within the buffer.
+
+`configs/coralnpu/coralnpu_se.py`, inside `build_system()`, immediately after
+`system = System()`:
+
+```diff
+  system = System()
++ system.cache_line_size = 32  # CoralNPU 256-bit (32-byte) instruction bus
+  system.clk_domain = SrcClockDomain(
+```
+
+**Why 32 bytes is correct for CoralNPU**
+
+CoralNPU's instruction bus is 256 bits (32 bytes) wide.  `fetch1LineSnapWidth=32`
+(already set in `coralnpu_cpu.py`) models this correctly.  The gem5
+`System::cache_line_size` default of 64 bytes was inherited from the x86/ARM
+default and does not reflect the CoralNPU bus width.  Setting
+`cache_line_size=32` aligns the fetch-alignment logic with the actual bus width.
+
+**Note on relationship to §11.11**
+
+§11.11 (vsetvli `branchTarget`) and §11.12 are **independent bugs** that happen
+to produce the same panic message.  §11.12 is the true cause of the 0xc74 panic:
+the zeros in `instBits` come entirely from the buffer overread, not from stale
+vtype.  §11.11 remains necessary for correct vector instruction decode after a
+vsetvli-induced pipeline flush.
+
+**Files modified:** `configs/coralnpu/coralnpu_se.py`
+
+**Rebuild required:** No — Python-only change; takes effect on next run.
+
+```bash
+# Re-run without rebuild:
+./build/RISCV/gem5.opt configs/coralnpu/coralnpu_se.py \
+    --cmd test_module_conv_1_1_new0.elf --cpu minor \
+    --itcm-start 0x0 --itcm-size 1024kB \
+    --dtcm-start 0x100000 --dtcm-size 1024kB \
+    --ext-mem-start 0x80000000 --ext-mem-size 512MB
 ```

@@ -44,7 +44,7 @@ def format VConfOp(code, write_code, declare_class, branch_class, *flags) {{
     decoder_output = VConfConstructor.subst(iop)
     decode_block = VConfDecodeBlock.subst(iop)
 
-    if "vsetivli" in name:
+    if "vsetivli" in name or name == "vsetvli":
         branchTargetTemplate = eval(branch_class)
         exec_output = VConfExecute.subst(iop) + branchTargetTemplate.subst(iop)
     else:
@@ -68,6 +68,31 @@ def template VSetVlDeclare {{
         %(class_name)s(ExtMachInst machInst, uint32_t elen, uint32_t vlen);
         Fault execute(ExecContext *, trace::InstRecord *) const override;
 
+        using %(base_class)s::generateDisassembly;
+
+    };
+}};
+
+def template VSetVliDeclare {{
+    //
+    // Static instruction class for "%(mnemonic)s".
+    //
+    class %(class_name)s : public %(base_class)s
+    {
+      private:
+        %(reg_idx_arr_decl)s;
+        VTYPE getNewVtype(VTYPE, VTYPE) const;
+        uint32_t getNewVL(
+            uint32_t, uint32_t, uint32_t, uint64_t, uint64_t) const;
+
+      public:
+        /// Constructor.
+        %(class_name)s(ExtMachInst machInst, uint32_t elen, uint32_t vlen);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        std::unique_ptr<PCStateBase> branchTarget(
+                const PCStateBase &branch_pc) const override;
+
+        using StaticInst::branchTarget;
         using %(base_class)s::generateDisassembly;
 
     };
@@ -206,6 +231,25 @@ def template VSetiVliBranchTarget {{
         npc->new_vconf(true);
         npc->vtype(new_vtype);
         npc->vl(new_vl);
+        return npc;
+    }
+}};
+
+def template VSetVliBranchTarget {{
+    std::unique_ptr<PCStateBase>
+    %(class_name)s::branchTarget(const PCStateBase &branch_pc) const
+    {
+        auto &rpc = branch_pc.as<RiscvISA::PCState>();
+
+        // vsetvli: vtype is encoded in zimm11; vl depends on rs1 (unknown
+        // at decode time).  Propagate the correct vtype so vill is accurate
+        // in subsequent machInst upper-bits; keep vl unchanged.
+        VTYPE new_vtype = getNewVtype(rpc.vtype(), zimm11);
+
+        std::unique_ptr<PCState> npc(dynamic_cast<PCState*>(rpc.clone()));
+        npc->set(rvSext(npc->pc() + 4));
+        npc->new_vconf(true);
+        npc->vtype(new_vtype);
         return npc;
     }
 }};

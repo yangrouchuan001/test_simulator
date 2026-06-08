@@ -155,6 +155,7 @@ def build_system(args):
     _mem_ranges.append(AddrRange(start=ext_mem_start, size=args.ext_mem_size))
 
     system = System()
+    system.cache_line_size = 32  # CoralNPU 256-bit (32-byte) instruction bus
     system.clk_domain = SrcClockDomain(
         clock=args.freq,
         voltage_domain=VoltageDomain(),
@@ -165,7 +166,8 @@ def build_system(args):
     if args.cpu == "atomic":
         system.mem_mode = "atomic"
         cpu = RiscvAtomicSimpleCPU()
-        cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False)]
+        cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False,
+                             privilege_mode_set="M")]
     else:
         system.mem_mode = "timing"
         cpu = CoralNPUMinorCPU()

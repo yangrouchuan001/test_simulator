@@ -5979,7 +5979,7 @@ decode QUADRANT default Unknown::unknown() {
                         VL = new_vl;
                         Vtype = new_vtype;
                         IsVset = true;
-                    }}, VSetVlDeclare, VSetVliBranchTarget
+                    }}, VSetVliDeclare, VSetVliBranchTarget
                       , SimdConfigOp, IsUncondControl
                       , IsIndirectControl);
                     0x1: decode BIT30 {
