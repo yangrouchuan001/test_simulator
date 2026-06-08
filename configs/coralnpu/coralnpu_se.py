@@ -202,8 +202,10 @@ def build_system(args):
         )
 
     # ── ITCM — Instruction Tightly Coupled Memory ─────────────────────────────
-    # 1-cycle SRAM latency at 1 GHz → 1 ns round-trip.
-    # 256-bit bus (32-byte data path) matches CoralNPU ibus interface.
+    # latency="1ps": 1 picosecond — minimum gem5 value, sub-cycle at any
+    # plausible clock (1ps << 1ns/cycle at 1 GHz) → effectively 0 latency.
+    # bandwidth="0B/s": gem5 MemoryBandwidth(0) → 0 ticks/byte → infinite
+    # bandwidth (no serialisation stall).
     #
     # conf_table_reported=False: excludes ITCM from PhysicalMemory::getConfAddrRanges().
     # gem5 SE MemPools are built from getConfAddrRanges(), which iterates an
@@ -213,20 +215,20 @@ def build_system(args):
     # ITCM still responds to bus accesses normally via its port connection.
     itcm = SimpleMemory(
         range=AddrRange(start=itcm_start, size=args.itcm_size),
-        latency="1ns",
-        bandwidth="32GB/s",
+        latency="1ps",
+        bandwidth="0B/s",
         conf_table_reported=False,
     )
     system.itcm = itcm
     system.membus.mem_side_ports = itcm.port
 
     # ── DTCM — Data Tightly Coupled Memory ────────────────────────────────────
-    # Same 1-cycle SRAM latency; 32-byte bus matches CoralNPU dbus.
+    # Same near-zero latency and infinite bandwidth as ITCM above.
     # conf_table_reported=False for the same reason as ITCM above.
     dtcm = SimpleMemory(
         range=AddrRange(start=dtcm_start, size=args.dtcm_size),
-        latency="1ns",
-        bandwidth="32GB/s",
+        latency="1ps",
+        bandwidth="0B/s",
         conf_table_reported=False,
     )
     system.dtcm = dtcm
@@ -239,18 +241,18 @@ def build_system(args):
         _gap_size = ext_mem_start - _dtcm_end
         proc_mem = SimpleMemory(
             range=AddrRange(start=_dtcm_end, size=_gap_size),
-            latency="1ns",
-            bandwidth="32GB/s",
+            latency="1ps",
+            bandwidth="0B/s",
         )
         system.proc_mem = proc_mem
         system.membus.mem_side_ports = proc_mem.port
 
     # ── External memory (AXI bus model) ──────────────────────────────────────
-    # 50 ns models typical AXI bus + off-chip SRAM/DDR latency.
+    # Near-zero latency and infinite bandwidth (same rationale as ITCM/DTCM).
     ext_mem = SimpleMemory(
         range=AddrRange(start=ext_mem_start, size=args.ext_mem_size),
-        latency="50ns",
-        bandwidth="8GB/s",
+        latency="1ps",
+        bandwidth="0B/s",
     )
     system.ext_mem = ext_mem
     system.membus.mem_side_ports = ext_mem.port

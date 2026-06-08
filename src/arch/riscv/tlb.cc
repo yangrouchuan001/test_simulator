@@ -602,7 +602,7 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
         Addr paddr;
 
         if (!p->pTable->translate(vaddr, paddr))
-            return std::make_shared<GenericPageTableFault>(req->getVaddr());
+            return std::make_shared<GenericPageTableFault>(vaddr);
 
         req->setPaddr(paddr);
 

@@ -457,7 +457,17 @@ MemState::fixupFault(Addr vaddr)
         return true;
     }
 
-    return false;
+    // Identity-map pages for MMIO device access (e.g. UART, RTC).
+    // For addresses not backed by any SimpleMemory, create VA=PA so the
+    // bus can route the physical access to the device (UartConsole, etc.).
+    // The RV32 TLB already masks the address to 32 bits before reaching
+    // here, so this receives e.g. 0xFFFFFFF8 rather than the sign-extended
+    // 0xfffffffffffffff8.  If no device claims the PA the bus will fault.
+    {
+        Addr vpage_start = roundDown(vaddr, _pageBytes);
+        _ownerProcess->map(vpage_start, vpage_start, _pageBytes);
+        return true;
+    }
 }
 
 Addr

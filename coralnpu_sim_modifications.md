@@ -55,6 +55,7 @@
     - 11.10 [Panic: mstatus is not accessible in 0 (AtomicSimpleCPU missing privilege_mode_set="M")](#1110-panic-mstatus-is-not-accessible-in-0-atomicsimplecpu-missing-privilege_mode_setm)
     - 11.11 [Illegal instruction machInst with vill=1 after vsetvli (missing branchTarget propagation)](#1111-illegal-instruction-machinst-with-vill1-after-vsetvli-missing-branchtarget-propagation)
     - 11.12 [Illegal instruction / instBits=0 at mid-block PC (cache_line_size vs fetch request size mismatch)](#1112-illegal-instruction--instbits0-at-mid-block-pc-cache_line_size-vs-fetch-request-size-mismatch)
+    - 11.13 [Panic: Page table fault at 0xfffffffffffffff8 (RV32 UART MMIO sign-extension + missing identity-map)](#1113-panic-page-table-fault-at-0xfffffffffffffff8-rv32-uart-mmio-sign-extension--missing-identity-map)
 
 ---
 
@@ -71,6 +72,8 @@
 | `configs/coralnpu/coralnpu_cpu.py` | **New** | `CoralNPUMinorCPU` class — scalar + RVV FU pool |
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, and `system.cache_line_size=32` |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
+| `src/arch/riscv/tlb.cc` | **Modified** | Pass RV32-masked `vaddr` (not raw `req->getVaddr()`) to `GenericPageTableFault` so fixupFault receives the 32-bit UART address |
+| `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -1919,6 +1922,139 @@ precise new vl always read MISCREG_VL at execute time, not from
 **Files modified:**
 - `src/arch/riscv/isa/formats/vector_conf.isa`
 - `src/arch/riscv/isa/decoder.isa`
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+### 11.13 Panic: Page table fault at 0xfffffffffffffff8 (RV32 UART MMIO sign-extension + missing identity-map)
+
+**Error observed**
+
+```
+src/sim/faults.cc:103: panic: panic condition !handled occurred:
+    Page table fault when accessing virtual address 0xfffffffffffffff8
+```
+
+Occurs when the firmware writes to the UART MMIO register at `0xFFFFFFF8`
+after the §11.12 (`cache_line_size=32`) fix allows the simulation to progress
+past the earlier instruction-fetch panic.
+
+**Root cause — two compounding bugs**
+
+**Bug A: RV32 sign-extension not propagated to GenericPageTableFault**
+
+The firmware computes the UART address as `-8` (a negative 32-bit integer):
+```
+li t0, -8        # t0 = 0xFFFFFFF8 (32-bit)
+sb a0, 0(t0)     # store byte to UART
+```
+
+In gem5's internal 64-bit representation, a negative 32-bit register value is
+sign-extended: `0xFFFFFFF8` → `0xFFFFFFFFFFFFFFF8`.
+
+`TLB::translateSE()` already calls `getValidAddr(req->getVaddr(), tc, mode)`
+which masks the address to 32 bits for RV32 (defined in `tlb.hh:179–193`):
+```cpp
+if (isa->rvType() == RV32)
+    return bits(vaddr, 31, 0);   // → 0xFFFFFFF8
+```
+
+However, when `pTable->translate(vaddr, paddr)` fails, the fault was created
+with the **original** unmasked address:
+```cpp
+// tlb.cc (before fix) — note req->getVaddr(), NOT vaddr
+return std::make_shared<GenericPageTableFault>(req->getVaddr());
+```
+
+`GenericPageTableFault::invokeSE()` calls `fixupFault` with this address,
+so fixupFault received `0xfffffffffffffff8` instead of `0xFFFFFFF8`.
+
+**Bug B: fixupFault has no MMIO fallback**
+
+Even with the correct 32-bit address `0xFFFFFFF8`, the four existing fixupFault
+checks all fail:
+1. VMA loop — no ELF segment covers `0xFFFFFFF8`
+2. Stack check — outside stack range
+3. Stack growth check — outside stack range
+4. `isMemAddr(0xFFFFFFF8)` — returns false; UartConsole is a PIO device, not
+   a `SimpleMemory`
+
+Result: `fixupFault` returns false → `faults.cc:103` panics.
+
+**Fix — two file changes**
+
+**1. `src/arch/riscv/tlb.cc`** (line ~605)
+
+Pass the RV32-masked address to the fault so `fixupFault` receives `0xFFFFFFF8`:
+
+```diff
+-        return std::make_shared<GenericPageTableFault>(req->getVaddr());
++        return std::make_shared<GenericPageTableFault>(vaddr);
+```
+
+`vaddr` is already the output of `getValidAddr()` — masked to 32 bits for RV32.
+
+**2. `src/sim/mem_state.cc`** — `MemState::fixupFault()`
+
+Add an MMIO identity-map fallback after the `isMemAddr` block:
+
+```diff
+     if (_ownerProcess->system->getPhysMem().isMemAddr(vaddr)) {
+         Addr vpage_start = roundDown(vaddr, _pageBytes);
+         _ownerProcess->allocateMem(vpage_start, _pageBytes);
+         return true;
+     }
++
++    // Identity-map pages for MMIO device access (e.g. UART, RTC).
++    // For addresses not backed by any SimpleMemory, create VA=PA so the
++    // bus can route the physical access to the device (UartConsole, etc.).
++    // The RV32 TLB already masks the address to 32 bits before reaching
++    // here, so this receives e.g. 0xFFFFFFF8 rather than the sign-extended
++    // 0xfffffffffffffff8.  If no device claims the PA the bus will fault.
++    {
++        Addr vpage_start = roundDown(vaddr, _pageBytes);
++        _ownerProcess->map(vpage_start, vpage_start, _pageBytes);
++        return true;
++    }
+```
+
+`Process::map(vaddr, paddr, size)` calls `pTable->map(vaddr, paddr, size, flags)`
+with an explicit physical address, creating an identity mapping VA=PA=`0xFFFFF000`.
+On retry, `pTable->translate(0xFFFFFFF8)` finds the mapping and returns
+`paddr=0xFFFFFFF8`. The bus routes the physical access to `UartConsole`.
+
+**How the fix chain works end-to-end**
+
+1. Firmware stores byte to `0xFFFFFFFFFFFFFFF8` (sign-extended in 64-bit reg).
+2. `TLB::translateSE`: `getValidAddr` masks → `vaddr = 0xFFFFFFF8`.
+3. `pTable->translate(0xFFFFFFF8)` → false (no mapping yet).
+4. `GenericPageTableFault(vaddr = 0xFFFFFFF8)` raised ← **Bug A fixed here**.
+5. `fixupFault(0xFFFFFFF8)` called.
+6. VMA/stack checks fail; `isMemAddr(0xFFFFFFF8)` = false.
+7. MMIO fallback: `Process::map(0xFFFFF000, 0xFFFFF000, PAGE_SIZE)` ← **Bug B fixed here**.
+8. `fixupFault` returns true.
+9. CPU retries the store; `translateSE` called again.
+10. `pTable->translate(0xFFFFFFF8)` → `paddr = 0xFFFFFFF8`.
+11. Bus routes physical access to `UartConsole` → byte printed to stdout.
+
+**Safety of the MMIO fallback**
+
+For addresses that are neither physical memory nor a valid device, the identity
+mapping routes the physical access to an unclaimed bus address. gem5 will fault
+("no target for request") rather than silently corrupting state. The check
+`isMemAddr(vaddr)` above the MMIO fallback still handles all legitimate
+data-memory accesses (ITCM, DTCM, ExtMem, proc_mem); the MMIO fallback only
+fires for addresses outside all `SimpleMemory` ranges.
+
+**Files modified:**
+- `src/arch/riscv/tlb.cc`
+- `src/sim/mem_state.cc`
 
 **Rebuild required:**
 
