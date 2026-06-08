@@ -56,6 +56,7 @@
     - 11.11 [Illegal instruction machInst with vill=1 after vsetvli (missing branchTarget propagation)](#1111-illegal-instruction-machinst-with-vill1-after-vsetvli-missing-branchtarget-propagation)
     - 11.12 [Illegal instruction / instBits=0 at mid-block PC (cache_line_size vs fetch request size mismatch)](#1112-illegal-instruction--instbits0-at-mid-block-pc-cache_line_size-vs-fetch-request-size-mismatch)
     - 11.13 [Panic: Page table fault at 0xfffffffffffffff8 (RV32 UART MMIO sign-extension + missing identity-map)](#1113-panic-page-table-fault-at-0xfffffffffffffff8-rv32-uart-mmio-sign-extension--missing-identity-map)
+    - 11.14 [Fatal: xbar unable to find destination for \[0xffffffe0:0x100000000\] (UART device covers < one cache line)](#1114-fatal-xbar-unable-to-find-destination-for-0xffffffe00x100000000-uart-device-covers--one-cache-line)
 
 ---
 
@@ -74,6 +75,7 @@
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | Pass RV32-masked `vaddr` (not raw `req->getVaddr()`) to `GenericPageTableFault` so fixupFault receives the 32-bit UART address |
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware |
+| `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -2153,4 +2155,116 @@ vsetvli-induced pipeline flush.
     --itcm-start 0x0 --itcm-size 1024kB \
     --dtcm-start 0x100000 --dtcm-size 1024kB \
     --ext-mem-start 0x80000000 --ext-mem-size 512MB
+```
+
+---
+
+### 11.14 Fatal: xbar unable to find destination for [0xffffffe0:0x100000000] (UART device covers < one cache line)
+
+**Error observed**
+
+```
+src/mem/xbar.cc:368: fatal: Unable to find destination for
+    [0xffffffe0:0x100000000] on system.membus
+```
+
+Occurs immediately after §11.13 (UART MMIO identity-map) is applied and the
+simulation is rebuilt.  The UART `sb` write now succeeds; the fatal fires on a
+subsequent memory request.
+
+**Root cause**
+
+§11.13 maps the 4 KB page containing the UART register as an identity mapping:
+`VA=0xFFFFF000 → PA=0xFFFFF000`.  Once this mapping exists, the TLB will
+successfully translate **any** address in `[0xFFFFF000, 0x100000000)` — not
+just the UART register at `0xFFFFFFF8`.
+
+The `UartConsole` device was previously registered with `pio_addr=0xFFFFFFF8,
+pio_size=8`, covering only `[0xFFFFFFF8, 0x100000000)` (8 bytes).
+
+After the UART page is mapped, MinorCPU's L1I cache generates a 32-byte
+cache-line fill for address `0xFFFFFFE0` (the 32-byte-aligned line containing
+the UART register area).  The SystemXBar attempts to route the full 32-byte
+request `[0xFFFFFFE0, 0x100000000)`, but requires a **single** device that
+covers the entire range.  No device covers `[0xFFFFFFE0, 0xFFFFFFF8)`, so the
+xbar fatals.
+
+The `UartConsole` read handler also had a latent bug: `pkt->setLE<uint64_t>(0)`
+writes 8 bytes unconditionally, overflowing the data buffer of any packet
+smaller than 8 bytes (e.g., a 4-byte status-register read).
+
+**Why the L1I fetch lands at 0xFFFFFFE0**
+
+After the UART page is identity-mapped (§11.13), the TLB no longer faults on
+any address in that page.  MinorCPU's branch predictor may speculatively
+predict a jump target within the UART page.  Fetch1 aligns instruction-fetch
+requests to `cache_line_size=32` bytes (§11.12 fix), producing a 32-byte
+request for the line `[0xFFFFFFE0, 0x100000000)`.  This speculative request
+would be squashed when the branch resolves — but the xbar fatal fires first.
+
+**Fix — two changes**
+
+**1. `configs/coralnpu/coralnpu_se.py`** — expand `UartConsole` to cover the
+full 4 KB page containing the UART register:
+
+```diff
+-        uart_addr = int(args.uart_addr, 16)
++        uart_addr = int(args.uart_addr, 16)
++        uart_page_base = uart_addr & ~4095   # 4 KB page-aligned start
+         system.uart_console = UartConsole(
+-            pio_addr=uart_addr,
+-            pio_size=8,
++            pio_addr=uart_page_base,
++            pio_size=4096,
+             pio_latency="1ns",
+         )
+```
+
+With `pio_size=4096`, the device covers `[0xFFFFF000, 0x100000000)`.  Any
+32-byte cache-line fill within that page is routed to `UartConsole`.  Writes
+to any offset still print the character byte (the write handler uses
+`pkt->getLE<uint8_t>()` regardless of address).
+
+**2. `src/dev/coralnpu/uart_console.cc`** — fix the read handler:
+
+```diff
++#include <cstring>
+ ...
+ Tick UartConsole::read(PacketPtr pkt)
+ {
+-    // TX-ready / no RX FIFO — always return 0.
+-    pkt->setLE<uint64_t>(0);
++    // Return zeros for any read size (status reads, 32-byte L1I fills, etc.)
++    memset(pkt->getPtr<uint8_t>(), 0, pkt->getSize());
+     pkt->makeAtomicResponse();
+     return pioDelay;
+ }
+```
+
+`memset` correctly zeros any packet size: 1-byte status reads, 4-byte word
+reads, and 32-byte L1I cache-line fills.  The previous `setLE<uint64_t>(0)`
+wrote exactly 8 bytes regardless of packet size, overflowing smaller buffers.
+
+**How the fix chain works**
+
+1. Firmware writes `sb char, 0xFFFFFFF8` (UART TX register).
+2. fixupFault (§11.13) maps page `VA=0xFFFFF000 → PA=0xFFFFF000`.
+3. `pTable->translate(0xFFFFFFF8)` → `PA=0xFFFFFFF8`.
+4. Bus routes to `UartConsole` (now covers `[0xFFFFF000, 0x100000000)`) ✓
+5. `UartConsole::write()` prints the byte ✓
+6. MinorCPU speculatively fetches from `0xFFFFFFE0` (32-byte-aligned line).
+7. `pTable->translate(0xFFFFFFE0)` → `PA=0xFFFFFFE0` (same mapped page).
+8. Bus routes 32-byte request to `UartConsole` (covers full page) ✓
+9. `UartConsole::read()` returns 32 zero bytes.
+10. Speculative "instruction" `0x00000000` is squashed when branch resolves ✓
+
+**Files modified:**
+- `configs/coralnpu/coralnpu_se.py`
+- `src/dev/coralnpu/uart_console.cc`
+
+**Rebuild required** (`uart_console.cc` is a C++ source file):
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
 ```

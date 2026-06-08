@@ -263,11 +263,30 @@ def build_system(args):
     # ── UART console — MMIO character output ──────────────────────────────────
     # Intercepts firmware printf implemented as  sb char, <uart_addr>.
     # The device prints each written byte to host stdout; reads return 0.
+    #
+    # pio_addr is page-aligned (4 KB) so that the device covers the ENTIRE
+    # page containing the UART register.  This is required because:
+    #
+    #   1. fixupFault (§11.13) identity-maps the 4 KB page containing the
+    #      UART register so that the TLB can translate firmware MMIO writes.
+    #
+    #   2. After the page is mapped, speculative L1I instruction-fetch
+    #      requests (32-byte cache-line fills) may land anywhere within the
+    #      same 4 KB page.  gem5's SystemXBar requires a SINGLE device to
+    #      cover the full 32-byte range of each request.  If the device only
+    #      covers 8 bytes at the UART register offset, the xbar fatals:
+    #      "Unable to find destination for [0xffffffe0:0x100000000]".
+    #
+    # With pio_size=4096 the UartConsole covers the full page; reads return
+    # zeros (harmless for squashed speculative fetches), and writes to any
+    # offset within the page still print the byte (firmware writes the TX
+    # register, which happens to be at offset 0xFF8 within the page).
     if args.uart_addr.lower() != "none":
         uart_addr = int(args.uart_addr, 16)
+        uart_page_base = uart_addr & ~4095   # 4 KB page-aligned start
         system.uart_console = UartConsole(
-            pio_addr=uart_addr,
-            pio_size=8,
+            pio_addr=uart_page_base,
+            pio_size=4096,
             pio_latency="1ns",
         )
         system.uart_console.pio = system.membus.mem_side_ports

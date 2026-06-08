@@ -1,6 +1,7 @@
 #include "dev/coralnpu/uart_console.hh"
 
 #include <cstdio>
+#include <cstring>
 
 #include "mem/packet.hh"
 #include "mem/packet_access.hh"
@@ -14,8 +15,10 @@ UartConsole::UartConsole(const Params &p)
 Tick
 UartConsole::read(PacketPtr pkt)
 {
-    // TX-ready / no RX FIFO — always return 0.
-    pkt->setLE<uint64_t>(0);
+    // TX-ready / no RX FIFO — return zeros for any read size.
+    // memset handles packets of any size (1-byte status reads, 32-byte
+    // L1I cache-line fills from speculative instruction fetches, etc.).
+    memset(pkt->getPtr<uint8_t>(), 0, pkt->getSize());
     pkt->makeAtomicResponse();
     return pioDelay;
 }
