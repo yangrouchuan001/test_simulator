@@ -42,6 +42,7 @@
 #include "debug/Faults.hh"
 #include "sim/debug.hh"
 #include "sim/full_system.hh"
+#include "sim/sim_exit.hh"
 #include "sim/system.hh"
 #include "sim/workload.hh"
 
@@ -318,7 +319,9 @@ void
 BreakpointFault::invokeSE(ThreadContext *tc, const StaticInstPtr &inst)
 {
     if (! tc->getSystemPtr()->trapToGdb(GDBSignal::TRAP, tc->contextId()) ) {
-        schedRelBreak(0);
+        // ebreak used as bare-metal exit: terminate the simulation cleanly
+        // so that atexit handlers (stats dump) run normally.
+        exitSimLoop("ebreak", 0);
     }
 }
 

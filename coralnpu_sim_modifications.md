@@ -57,6 +57,7 @@
     - 11.12 [Illegal instruction / instBits=0 at mid-block PC (cache_line_size vs fetch request size mismatch)](#1112-illegal-instruction--instbits0-at-mid-block-pc-cache_line_size-vs-fetch-request-size-mismatch)
     - 11.13 [Panic: Page table fault at 0xfffffffffffffff8 (RV32 UART MMIO sign-extension + missing identity-map)](#1113-panic-page-table-fault-at-0xfffffffffffffff8-rv32-uart-mmio-sign-extension--missing-identity-map)
     - 11.14 [Fatal: xbar unable to find destination for \[0xffffffe0:0x100000000\] (UART device covers < one cache line)](#1114-fatal-xbar-unable-to-find-destination-for-0xffffffe00x100000000-uart-device-covers--one-cache-line)
+    - 11.15 [Missing output and stats — simulation exits via SIGTRAP when firmware uses ebreak as exit](#1115-missing-output-and-stats--simulation-exits-via-sigtrap-when-firmware-uses-ebreak-as-exit)
 
 ---
 
@@ -76,6 +77,7 @@
 | `src/arch/riscv/tlb.cc` | **Modified** | Pass RV32-masked `vaddr` (not raw `req->getVaddr()`) to `GenericPageTableFault` so fixupFault receives the 32-bit UART address |
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
+| `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -2263,6 +2265,110 @@ wrote exactly 8 bytes regardless of packet size, overflowing smaller buffers.
 - `src/dev/coralnpu/uart_console.cc`
 
 **Rebuild required** (`uart_console.cc` is a C++ source file):
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+## §11.15 — Missing output and stats — simulation exits via SIGTRAP when firmware uses `ebreak` as exit
+
+**Symptom**
+
+After all prior fixes (§11.12–§11.14) the simulation runs without panic, but:
+- The firmware's final `printf` output is not printed.
+- `m5out/stats.txt` is empty / not written.
+- The `[coralnpu_se] Exit: …` lines from `coralnpu_se.py` never appear.
+- The following warning is printed (from `src/sim/debug.cc:86`):
+
+```
+src/sim/debug.cc:86: warn: need to stop all queues
+```
+
+**Root cause**
+
+The firmware uses `ebreak` (`0x00100073`) as its termination instruction:
+
+```asm
+; success path (main() returned 0)
+0x00000140:  73001000     ebreak
+; failure path
+0x00000128:  73001000     ebreak
+```
+
+In gem5 SE mode, `ebreak` raises `BreakpointFault`.  The pre-fix handler was:
+
+```cpp
+// src/arch/riscv/faults.cc
+void
+BreakpointFault::invokeSE(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    if (! tc->getSystemPtr()->trapToGdb(GDBSignal::TRAP, tc->contextId()) ) {
+        schedRelBreak(0);   // ← this is the problem
+    }
+}
+```
+
+`schedRelBreak(0)` calls `schedBreak(curTick())`, which:
+1. Emits `warn: need to stop all queues` (debug.cc:86).
+2. Schedules a `DebugBreakEvent` at `curTick()`.
+3. When the event fires, calls `debug::breakpoint()` → `kill(getpid(), SIGTRAP)`.
+
+In `gem5.opt` builds `NDEBUG` is **not** defined, so `debug::breakpoint()` sends the
+real `SIGTRAP` signal.  Because gem5 installs no `SIGTRAP` handler, the OS default
+action applies: **the process is terminated with core dump**.
+
+Crucially, a signal-induced termination bypasses Python's `atexit` mechanism, so:
+- `stats.dump` (registered via `atexit` at first `m5.simulate()` call) never runs →
+  `stats.txt` is empty.
+- The Python `coralnpu_se.py` exit-message prints never execute.
+- Any still-buffered `UartConsole` output that wasn't yet flushed by the host
+  `putchar` call is lost.
+
+**Fix — `src/arch/riscv/faults.cc`**
+
+Add `sim/sim_exit.hh` to the includes and replace `schedRelBreak(0)` with a clean
+`exitSimLoop` call:
+
+```cpp
+// includes added:
+#include "sim/sim_exit.hh"
+
+// BreakpointFault::invokeSE — BEFORE:
+void
+BreakpointFault::invokeSE(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    if (! tc->getSystemPtr()->trapToGdb(GDBSignal::TRAP, tc->contextId()) ) {
+        schedRelBreak(0);
+    }
+}
+
+// BreakpointFault::invokeSE — AFTER:
+void
+BreakpointFault::invokeSE(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    if (! tc->getSystemPtr()->trapToGdb(GDBSignal::TRAP, tc->contextId()) ) {
+        // ebreak used as bare-metal exit: terminate the simulation cleanly
+        // so that atexit handlers (stats dump) run normally.
+        exitSimLoop("ebreak", 0);
+    }
+}
+```
+
+`exitSimLoop("ebreak", 0)` schedules a `SimLoopExitEvent` at `curTick()`.
+When the event fires `m5.simulate()` returns the event object to Python, the
+Python script prints its exit messages, and the `atexit`-registered `stats.dump`
+writes `m5out/stats.txt`.
+
+The GDB branch (`trapToGdb`) is unchanged: when a remote GDB is attached,
+`ebreak` still delivers `GDBSignal::TRAP` to the debugger rather than exiting.
+
+**Files modified:**
+- `src/arch/riscv/faults.cc`
+
+**Rebuild required:**
 
 ```bash
 cd /orange/ZSP/home/cn2095/test_simulator
