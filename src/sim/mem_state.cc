@@ -445,19 +445,16 @@ MemState::fixupFault(Addr vaddr)
         return true;
     }
 
-    // Demand-page any address that falls within a conf-reported physical memory
-    // range (gap fill, ExtMem).  This handles bare-metal firmware that accesses
-    // memory locations which were never explicitly mmap'd or declared as ELF
-    // segments — e.g. BSS zeroing past a TCM boundary, or stack/heap in the
-    // gap region.  ITCM and DTCM are excluded because they have
-    // conf_table_reported=False and therefore do not appear in getConfAddrRanges().
-    for (const auto &range :
-             _ownerProcess->system->getPhysMem().getConfAddrRanges()) {
-        if (range.contains(vaddr)) {
-            Addr vpage_start = roundDown(vaddr, _pageBytes);
-            _ownerProcess->allocateMem(vpage_start, _pageBytes);
-            return true;
-        }
+    // Demand-page any address that falls within any mapped physical memory
+    // range (gap fill, ExtMem, and ITCM/DTCM which have
+    // conf_table_reported=False).  isMemAddr() checks all ranges, not just
+    // conf-table-reported ones, so TCM addresses above the PT_LOAD VMA end
+    // (e.g. runtime BSS, stack, or malloc beyond the declared segment) are
+    // handled correctly.
+    if (_ownerProcess->system->getPhysMem().isMemAddr(vaddr)) {
+        Addr vpage_start = roundDown(vaddr, _pageBytes);
+        _ownerProcess->allocateMem(vpage_start, _pageBytes);
+        return true;
     }
 
     return false;

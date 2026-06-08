@@ -50,6 +50,8 @@
     - 11.5 [Fatal: Out of memory, please increase size of physical memory](#115-fatal-out-of-memory-please-increase-size-of-physical-memory)
     - 11.6 [Panic: minstret is not accessible in 0](#116-panic-minstret-is-not-accessible-in-0)
     - 11.7 [warn: Ignoring write to miscreg INSTRET / panic: Page table fault at 0x2000e4](#117-warn-ignoring-write-to-miscreg-instret--panic-page-table-fault-when-accessing-virtual-address-0x2000e4)
+    - 11.8 [Simulation stall — only 10 instructions committed in 378M cycles (IsSerializeAfter on CSR instructions)](#118-simulation-stall--only-10-instructions-committed-in-378-million-cycles-isserializeafter-on-csr-instructions)
+    - 11.9 [Panic: Page table fault when accessing virtual address in TCM range (fixupFault conf-only check)](#119-panic-page-table-fault-when-accessing-virtual-address-in-tcm-range-fixupfault-conf-only-check)
 
 ---
 
@@ -1496,6 +1498,236 @@ mapped to `conf_table_reported=True` ranges near the faulting address
 returns only ExtMem (which begins far above typical user-space addresses).  The
 new fallback loop finds no matching range and falls through to the original
 `return false`, preserving existing behaviour.
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+### 11.8 Simulation stall — only 10 instructions committed in 378 million cycles (IsSerializeAfter on CSR instructions)
+
+#### Symptom
+
+After fixing the page-table fault (11.7), the simulation runs but hangs: only 10
+instructions commit in ~378 million simulated cycles (CPI ≈ 37.8 M), consuming
+322 host seconds.  Enabling `--debug-flags=MinorExecute` shows the non-CSR
+instructions after the opening CSR block being repeatedly discarded:
+
+```
+26000: system.cpu.execute: Discarding inst: 0/2.1/3/12.12 pc: 0x10 (auipc)
+       as its stream state was unexpected, expected: 3
+```
+
+The same auipc at PC=0x10 is refetched and discarded in every subsequent cycle,
+creating an infinite loop.
+
+#### Root cause
+
+Every one of the six CSR instruction variants in `decoder.isa` carried the
+`IsSerializeAfter` pipeline flag:
+
+```
+format CSROp {
+    0x1: csrrw({{ … }}, 'RD != 0', 'true'
+          , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+    0x2: csrrs({{ … }}, 'true', 'RS1 != 0'
+          , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+    … (all 6 variants identical)
+}
+```
+
+In gem5's MinorCPU, `IsSerializeAfter` causes the pipeline to:
+
+1. Commit the flagged instruction.
+2. **Increment the global stream sequence number.**
+3. Discard every in-flight instruction whose stream ID no longer matches.
+
+The firmware's entry code begins with four consecutive CSR instructions
+(PC=0x0–0xC, resetting `minstret` and reading `mhartid`).  Because
+`decodeInputWidth=4`, MinorCPU issues all four in the same decode cycle
+(tick 18000).  What follows is a cascading flush:
+
+| Tick  | Event |
+|-------|-------|
+| 18000 | All 4 CSRs issued; auipc at PC=0x10 prefetched with stream ID 1 |
+| 19000 | CSR at PC=0x0 commits → stream 1→2; auipc (stream 1) discarded |
+| 20000 | CSRs at PC=0x4, 0x8, 0xC commit back-to-back (executeCommitLimit=4) → streams 2→3→4→5; each newly fetched auipc is discarded before it can commit |
+| 21000+ | Pipeline stuck: auipc always carries a stale stream ID by commit time |
+
+The result is an infinite discard/refetch loop — the simulation never advances
+past the 10th committed instruction.
+
+#### Why `IsSerializeAfter` exists on CSR instructions
+
+The flag was added conservatively: a CSR write that changes SATP or MSTATUS
+(e.g. enabling virtual memory or switching privilege mode) **does** require the
+pipeline to be flushed, because previously fetched instructions may have been
+decoded under wrong privilege or address-translation assumptions.
+
+For general-purpose Linux SE simulations this is overly conservative but harmless
+— Linux rarely issues long back-to-back CSR sequences.  For the CoralNPU
+bare-metal firmware, which issues four CSRs at startup (counter resets + hartid
+read), the cascade becomes a deadlock.
+
+#### Fix
+
+Remove `IsSerializeAfter` from all six CSR instruction definitions in
+`src/arch/riscv/isa/decoder.isa`, keeping only `IsNonSpeculative` and
+`No_OpClass`:
+
+```diff
+--- a/src/arch/riscv/isa/decoder.isa
++++ b/src/arch/riscv/isa/decoder.isa
+@@ CSROp format block
+-    0x1: csrrw( … , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+-    0x2: csrrs( … , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+-    0x3: csrrc( … , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+-    0x5: csrrwi(… , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+-    0x6: csrrsi(… , IsSerializeAfter, IsNonSpeculative, No_OpClass);
+-    0x7: csrrci(… , IsSerializeAfter, IsNonSpeculative, No_OpClass);
++    0x1: csrrw( … , IsNonSpeculative, No_OpClass);
++    0x2: csrrs( … , IsNonSpeculative, No_OpClass);
++    0x3: csrrc( … , IsNonSpeculative, No_OpClass);
++    0x5: csrrwi(… , IsNonSpeculative, No_OpClass);
++    0x6: csrrsi(… , IsNonSpeculative, No_OpClass);
++    0x7: csrrci(… , IsNonSpeculative, No_OpClass);
+```
+
+`IsNonSpeculative` is retained: it prevents CSR instructions from executing
+before all preceding instructions have committed (correct ordering), but does
+**not** flush the instructions that follow.
+
+#### Why this is safe for CoralNPU firmware
+
+The firmware runs entirely in M-mode and never:
+- Switches between U/S/M privilege modes (no `mret`/`sret` that would require
+  re-fetching under a different privilege).
+- Enables the MMU (no write to SATP).
+- Changes instruction encoding (no `misa` write that would affect decode).
+
+For these CSR writes (counter resets, `mhartid` read) the pipeline needs no
+flush — the instructions fetched after the CSR are correct regardless of the
+CSR result.  `IsNonSpeculative` alone ensures the CSR executes in-order.
+
+**Note:** If the simulator is later used for Linux full-system or supervisor-mode
+workloads that write SATP or MSTATUS, consider restoring `IsSerializeAfter`
+specifically for those CSRs (SATP = 0x180, MSTATUS = 0x300, SSTATUS = 0x100).
+
+**File modified:** `src/arch/riscv/isa/decoder.isa` — the `format CSROp` block
+(lines ~6384–6413).
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+### 11.9 Panic: Page table fault when accessing virtual address in TCM range (fixupFault conf-only check)
+
+#### Symptom
+
+```
+src/sim/faults.cc:103: panic: panic condition !handled && ...
+    Page table fault when accessing virtual address 0x105004
+```
+
+Occurs when running a different ELF
+(`test_module_conv_1_1_new0.elf`) with larger TCM parameters:
+
+```
+--itcm-start 0x0    --itcm-size 1024kB
+--dtcm-start 0x100000 --dtcm-size 1024kB
+--ext-mem-start 0x80000000 --ext-mem-size 512MB
+```
+
+#### Root cause
+
+The ELF memory layout for this binary is:
+
+| PT_LOAD segment | VirtAddr | MemSiz | Covers |
+|-----------------|----------|--------|--------|
+| .text           | 0x0      | 0x96910 | ITCM [0x0, 0x100000) |
+| .data/.bss      | 0x100000 | 0x4a88  | DTCM → ends at **0x104a88** |
+| .stack          | 0x1fe000 | 0x2000  | DTCM top |
+| .rodata         | 0x80000000 | 0x42056c | ExtMem |
+| .heap           | 0x82000000 | 0x1000000 | ExtMem |
+
+VA 0x105004 = 0x104a88 + 0x57c — **1404 bytes past the .data/.bss VMA end**,
+but still within the 1 MB DTCM range [0x100000, 0x200000).  The firmware
+accesses this address at runtime (likely through newlib malloc/sbrk touching
+memory beyond the statically declared BSS extent).
+
+`MemState::fixupFault()` checks, in order:
+1. **Registered VMAs** — the PT_LOAD VMA ends at 0x104a88 → miss.
+2. **Stack growth region** — not the stack → miss.
+3. **`getConfAddrRanges()` loop** (the fix added in §11.7) — returns only
+   `conf_table_reported=True` ranges; DTCM has `conf_table_reported=False`
+   → miss.
+4. `return false` → `panic`.
+
+The §11.7 fallback was necessary but not sufficient: it covered the gap fill
+and ExtMem, but not ITCM/DTCM which are intentionally excluded from the
+conf-table to avoid becoming pool 0 (see §11.5).
+
+#### Fix
+
+Replace the `getConfAddrRanges()` loop with a single call to
+`PhysicalMemory::isMemAddr()`, which checks **all** physical memory ranges
+regardless of `conf_table_reported`:
+
+```diff
+--- a/src/sim/mem_state.cc
++++ b/src/sim/mem_state.cc
+-    // Demand-page any address that falls within a conf-reported physical memory
+-    // range (gap fill, ExtMem). ...
+-    for (const auto &range :
+-             _ownerProcess->system->getPhysMem().getConfAddrRanges()) {
+-        if (range.contains(vaddr)) {
+-            Addr vpage_start = roundDown(vaddr, _pageBytes);
+-            _ownerProcess->allocateMem(vpage_start, _pageBytes);
+-            return true;
+-        }
+-    }
++    // Demand-page any address that falls within any mapped physical memory
++    // range (gap fill, ExtMem, and ITCM/DTCM which have
++    // conf_table_reported=False).  isMemAddr() checks all ranges, not just
++    // conf-table-reported ones, so TCM addresses above the PT_LOAD VMA end
++    // (e.g. runtime BSS, stack, or malloc beyond the declared segment) are
++    // handled correctly.
++    if (_ownerProcess->system->getPhysMem().isMemAddr(vaddr)) {
++        Addr vpage_start = roundDown(vaddr, _pageBytes);
++        _ownerProcess->allocateMem(vpage_start, _pageBytes);
++        return true;
++    }
+```
+
+`isMemAddr()` is declared in `mem/physical.hh:214` and returns true if the
+address falls within any `SimpleMemory` object attached to the system,
+including ITCM and DTCM.
+
+**Why this is safe**
+
+When `allocateMem()` is called for a VA in the DTCM range, it allocates a
+physical page from the available SE memory pool (the gap fill `proc_mem`
+or ExtMem — whichever pool has space).  The VA maps to a PA in `proc_mem`,
+not to DTCM's physical range, so bus transactions for this demand-paged
+address go to `proc_mem` rather than the DTCM `SimpleMemory` device.
+Functionally the memory is accessible; only the timing model is slightly
+approximate (both use 1 ns latency, so the difference is zero in practice).
+
+For addresses that are truly unmapped (e.g. a wild pointer to 0xDEADBEEF),
+`isMemAddr()` returns false, fixupFault() returns false, and gem5 still
+panics correctly.
+
+**File modified:** `src/sim/mem_state.cc` — the final fallback block in
+`MemState::fixupFault()`.
 
 **Rebuild required:**
 
