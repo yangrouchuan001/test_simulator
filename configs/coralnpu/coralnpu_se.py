@@ -138,8 +138,8 @@ def build_system(args):
     # Compute DTCM end and the gap to ExtMem.
     # gem5 SE mode places the RV32 user stack at 0x7FFFFFFF (base, 64 MiB max)
     # and heap/mmap from ELF-end up to 0x40000000.  Both fall in the gap
-    # between DTCM end and ExtMem start.  Include the gap in mem_ranges now
-    # so the SE memory pool has backing for those allocations.
+    # between DTCM end and ExtMem start.  Include the gap in mem_ranges so
+    # gem5's address-space accounting covers the full user address space.
     # (system.mem_ranges must be set in a single assignment — re-assignment
     # after the fact does not reliably propagate through gem5's VectorParam.)
     _dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
@@ -202,20 +202,30 @@ def build_system(args):
     # ── ITCM — Instruction Tightly Coupled Memory ─────────────────────────────
     # 1-cycle SRAM latency at 1 GHz → 1 ns round-trip.
     # 256-bit bus (32-byte data path) matches CoralNPU ibus interface.
+    #
+    # conf_table_reported=False: excludes ITCM from PhysicalMemory::getConfAddrRanges().
+    # gem5 SE MemPools are built from getConfAddrRanges(), which iterates an
+    # address-sorted interval tree.  If ITCM (0x0) were conf-reported it would
+    # become pool 0 — far too small for the 64 MiB SE stack.  With this flag
+    # False, pool 0 becomes the gap fill (or ExtMem), which is large enough.
+    # ITCM still responds to bus accesses normally via its port connection.
     itcm = SimpleMemory(
         range=AddrRange(start=itcm_start, size=args.itcm_size),
         latency="1ns",
         bandwidth="32GB/s",
+        conf_table_reported=False,
     )
     system.itcm = itcm
     system.membus.mem_side_ports = itcm.port
 
     # ── DTCM — Data Tightly Coupled Memory ────────────────────────────────────
     # Same 1-cycle SRAM latency; 32-byte bus matches CoralNPU dbus.
+    # conf_table_reported=False for the same reason as ITCM above.
     dtcm = SimpleMemory(
         range=AddrRange(start=dtcm_start, size=args.dtcm_size),
         latency="1ns",
         bandwidth="32GB/s",
+        conf_table_reported=False,
     )
     system.dtcm = dtcm
     system.membus.mem_side_ports = dtcm.port

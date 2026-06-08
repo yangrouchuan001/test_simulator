@@ -744,8 +744,8 @@ Level 2 provides **approximate** vector timing, not exact cycle-accurate matchin
 
 ## 11. Build Fixes — Errors Encountered and Resolved
 
-This section records the two build errors that appeared during development and
-how each was diagnosed and fixed.
+This section records the build and runtime errors that appeared during development
+and how each was diagnosed and fixed.
 
 ---
 
@@ -1041,85 +1041,175 @@ Memory Usage: 689824 KBytes
 Program aborted at tick 0
 ```
 
-**Root cause**
+This error occurred at tick 0 on every simulation run, regardless of the
+binary being simulated.  Three fix attempts were needed before the root cause
+was fully understood.
 
-gem5 SE mode performs its own OS-emulation memory management on top of the
-declared `system.mem_ranges`.  For a 32-bit RISC-V process, gem5 places the
-user stack and heap at fixed virtual addresses regardless of the firmware's
-linker script:
+---
 
-| Region | Address range | Size |
-|--------|--------------|------|
-| Stack base | `0x7FFFFFFF` (growing downward) | 64 MiB max |
+#### Background: how gem5 SE builds memory pools
+
+`SEWorkload::setSystem()` (in `src/sim/se_workload.cc`) builds its `MemPools`
+object as follows:
+
+```cpp
+AddrRangeList memories = sys->getPhysMem().getConfAddrRanges();
+memPools.populate(memories);
+```
+
+`MemPools::populate()` iterates the list in order and creates one pool per
+entry:
+
+```cpp
+void MemPools::populate(const AddrRangeList &memories) {
+    for (const auto &mem : memories)
+        pools.emplace_back(pageShift, mem.start(), mem.end());
+}
+```
+
+`Process::allocateMem()` always calls `allocPhysPages(pool_id=0)` — it draws
+all physical pages from **pool 0 only**.
+
+For a 32-bit RISC-V process, gem5 pre-reserves a large fixed SE stack:
+
+| Region | Address range | Pages needed |
+|--------|--------------|-------------|
+| Stack base | `0x7FFFFFFF` (growing downward) | up to 16 384 (64 MiB) |
 | Stack bottom | `0x40000000` | — |
-| Heap / mmap | ELF image end → `0x40000000` | variable |
+| Heap / mmap | ELF end → `0x40000000` | variable |
 
-With the user's memory map:
+All of these allocations come from pool 0.  Pool 0 must therefore be large
+enough to hold the full SE process image (ELF + stack + heap).
 
-| Region | Start | End |
-|--------|-------|-----|
-| ITCM | `0x00000000` | `0x000FFFFF` |
-| DTCM | `0x00100000` | `0x001FFFFF` |
-| *(gap)* | `0x00200000` | `0x7FFFFFFF` |
-| ExtMem | `0x80000000` | `0x9FFFFFFF` |
+---
 
-The entire gem5 SE stack and heap (`0x00200000–0x7FFFFFFF`) falls in the
-unmapped gap between DTCM and ExtMem.  When `m5.instantiate()` tries to
-allocate physical pages for the user stack, the memory pool finds no pool
-covering that range and calls `fatal("Out of memory")`.
+#### Root cause
 
-This is a property of gem5 SE mode, not of the firmware itself.  The
-firmware's own stack (set in the linker script) is within DTCM; the failing
-allocation is gem5's OS-emulation stack.
+The key function is `PhysicalMemory::getConfAddrRanges()` in
+`src/mem/physical.cc`:
 
-**Fix**
+```cpp
+PhysicalMemory::getConfAddrRanges() const {
+    AddrRangeList ranges;
+    for (const auto& r : addrMap) {        // ← addrMap is an interval tree
+        if (r.second->isConfReported()) {  // ← only conf-reported memories
+            ranges.push_back(r.first);
+        }
+    }
+    return ranges;
+}
+```
 
-Compute all memory ranges — including the gap fill — upfront and set
-`system.mem_ranges` in a **single assignment** before the `System` object
-is constructed.  Re-assigning `system.mem_ranges` after initial set does not
-reliably propagate through gem5's `VectorParam`, so appending later is not
-a valid approach.
+`addrMap` is an `AddrRangeMap` backed by an **interval tree sorted by start
+address**.  Iterating it always yields ranges in ascending address order,
+regardless of insertion order or the order of `system.mem_ranges`.
+
+`isConfReported()` returns the `conf_table_reported` flag of each
+`AbstractMemory` object.  By default, `conf_table_reported=True` for all
+`SimpleMemory` objects.
+
+With the default `conf_table_reported=True` on ITCM and DTCM, the pool list
+was always (sorted by address):
+
+```
+pool 0  →  ITCM    0x00000000 – …   (e.g. 8 kB, 2 pages)     ← pool 0 is tiny!
+pool 1  →  DTCM    0x00010000 – …   (e.g. 32 kB, 8 pages)
+pool 2  →  gap     0x00018000 – 0x7FFFFFFF   (~2 GB, large)
+pool 3  →  ExtMem  0x80000000 – …   (256 MB)
+```
+
+`allocPhysPages(16384, pool_id=0)` tried to allocate 16 384 pages from ITCM
+(2 pages at 8 kB) and immediately exhausted it.
+
+---
+
+#### Failed attempt 1 — ensure gap fill is in `system.mem_ranges`
+
+The gap fill was originally appended to `system.mem_ranges` after the initial
+`system = System()` construction, which gem5's `VectorParam` does not reliably
+propagate.  Fixing this (single-assignment with gap fill included) was
+necessary but not sufficient: pool 0 was still ITCM (smallest start address).
+
+#### Failed attempt 2 — reorder `system.mem_ranges` to put gap fill first
+
+Putting the gap fill first in `_mem_ranges` had no effect on pool ordering
+because `getConfAddrRanges()` ignores `system.mem_ranges` entirely — it builds
+the list from the address-sorted `addrMap` interval tree.  The pool order is
+always determined by start address, not by the Python declaration order.
+
+---
+
+#### Fix — `conf_table_reported=False` on ITCM and DTCM
+
+The `conf_table_reported` flag on an `AbstractMemory` controls whether
+`isConfReported()` returns `True` and therefore whether the memory appears
+in `getConfAddrRanges()`.  Setting it `False` on ITCM and DTCM removes them
+from the pool list entirely:
 
 ```python
-from m5.util.convert import toMemorySize   # added to imports
+itcm = SimpleMemory(
+    range=AddrRange(start=itcm_start, size=args.itcm_size),
+    latency="1ns",
+    bandwidth="32GB/s",
+    conf_table_reported=False,   # ← exclude from MemPools
+)
 
-# At the top of build_system(), before System() is constructed:
-_dtcm_end = dtcm_start + int(toMemorySize(args.dtcm_size))
-_has_gap  = _dtcm_end < ext_mem_start
-
-_mem_ranges = [
-    AddrRange(start=itcm_start, size=args.itcm_size),
-    AddrRange(start=dtcm_start, size=args.dtcm_size),
-]
-if _has_gap:
-    _mem_ranges.append(AddrRange(start=_dtcm_end,
-                                 size=ext_mem_start - _dtcm_end))
-_mem_ranges.append(AddrRange(start=ext_mem_start, size=args.ext_mem_size))
-
-system = System()
-system.mem_ranges = _mem_ranges   # single assignment — includes gap
-
-# Later, after the bus is created, wire the backing SimpleMemory:
-if _has_gap:
-    proc_mem = SimpleMemory(
-        range=AddrRange(start=_dtcm_end, size=ext_mem_start - _dtcm_end),
-        latency="1ns", bandwidth="32GB/s",
-    )
-    system.proc_mem = proc_mem
-    system.membus.mem_side_ports = proc_mem.port
+dtcm = SimpleMemory(
+    range=AddrRange(start=dtcm_start, size=args.dtcm_size),
+    latency="1ns",
+    bandwidth="32GB/s",
+    conf_table_reported=False,   # ← exclude from MemPools
+)
 ```
+
+With ITCM and DTCM excluded, the pool list becomes:
+
+```
+pool 0  →  gap fill  0x00200000 – 0x7FFFFFFF   (~2 GB)   ← large enough ✓
+pool 1  →  ExtMem    0x80000000 – …            (512 MB)
+```
+
+(If no gap exists — i.e. DTCM end ≥ ExtMem start — pool 0 becomes ExtMem,
+which is 256 MB+ and also large enough.)
+
+The gap fill is still backed by `proc_mem` SimpleMemory (which retains the
+default `conf_table_reported=True`), so it appears in the pool and provides
+physical memory for all SE allocations.
+
+`system.mem_ranges` is restored to natural address order (ITCM, DTCM, gap,
+ExtMem) since pool ordering no longer depends on it.
+
+---
+
+**Why this is safe: ITCM/DTCM still function normally**
+
+`conf_table_reported` only controls pool registration.  Bus routing is
+independent: `SimpleMemory` advertises its address range via `getAddrRanges()`
+on its port, and the `SystemXBar` routes physical accesses accordingly.
+ITCM and DTCM still respond to any bus access whose physical address falls in
+their configured ranges.
+
+In SE mode, however, physical addresses are allocated from pool 0 (gap fill).
+The `EmulationPageTable` maps firmware virtual addresses (e.g. `VA=0x0` for
+the text segment) to physical pages in the gap fill.  When the CPU fetches
+from `VA=0x0`, the TLB translates to a gap fill physical address and the bus
+routes to `proc_mem`.  ITCM SimpleMemory is never reached in SE mode; it
+exists on the bus but is effectively dormant.  The `latency="1ns"` on
+`proc_mem` matches ITCM's latency, so timing is identical.
 
 **Why this does not waste host RAM**
 
-`SimpleMemory` backs its address space with `mmap(MAP_ANONYMOUS | MAP_NORESERVE)`.
-The host kernel does not commit physical pages until they are first touched.
-For the user's default gap (`0x200000`–`0x80000000` ≈ 2 GB), only the pages
-that the gem5 SE stack, heap, and loader actually access are committed — in
-practice a few MiB for a simple firmware binary.
+`SimpleMemory` backs its address space with
+`mmap(MAP_ANONYMOUS | MAP_NORESERVE)`.  The host kernel commits physical RAM
+only on first access.  For the ~2 GB gap fill, only pages actually touched by
+the SE loader, stack, and heap are committed — typically a few MiB.
+
+---
 
 **Rule**
 
-When declaring a non-contiguous CoralNPU memory map with a gap between DTCM
-and ExtMem, gem5 SE mode always needs backing memory across the entire
-32-bit user address space below ExtMem.  The gap-fill is now automatic in
-`coralnpu_se.py` and requires no user action.
+In gem5 SE mode, pool ordering is determined by the **start address** of each
+`conf_table_reported=True` `SimpleMemory` object, not by `system.mem_ranges`
+declaration order.  For a CoralNPU memory map where ITCM/DTCM have low
+addresses but small sizes, set `conf_table_reported=False` on both TCMs so
+the large gap fill (or ExtMem) becomes pool 0.
