@@ -331,10 +331,11 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     # vlen=128         : CoralNPU rvvVlen=128 (16-byte vector registers)
     # elen=32          : CoralNPU max element width = 32 bits (int8/16/32 only)
     isa = [RiscvISA(
-        riscv_type = "RV32",
-        enable_rvv = True,
-        vlen       = 128,
-        elen       = 32,
+        riscv_type        = "RV32",
+        enable_rvv        = True,
+        vlen              = 128,
+        elen              = 32,
+        privilege_mode_set = "M",   # bare-metal M-mode only; no S/U modes
     )]
     mmu = RiscvMMU()
 

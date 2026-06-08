@@ -102,13 +102,18 @@ RiscvProcess64::initState()
     argsInit<uint64_t>(PageBytes);
     for (ContextID ctx: contextIds) {
         auto *tc = system->threads[ctx];
-        tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);
         auto *isa = dynamic_cast<ISA*>(tc->getIsaPtr());
         fatal_if(isa->rvType() != RV64, "RISC V CPU should run in 64 bits mode");
         MISA misa = tc->readMiscRegNoEffect(MISCREG_ISA);
-        fatal_if(!(misa.rvu && misa.rvs),
-            "RISC V SE mode can't run without supervisor and user "
-            "privilege modes.");
+        if (misa.rvu) {
+            // Linux user-space: run at U-mode (requires S-mode).
+            tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);
+            fatal_if(!misa.rvs,
+                "RISC V SE mode can't run without supervisor and user "
+                "privilege modes.");
+        }
+        // M-only ISA (privilege_mode_set="M"): keep PRV_M from reset so that
+        // bare-metal firmware can access M-mode CSRs (e.g. minstret, mstatus).
     }
 }
 
@@ -120,13 +125,18 @@ RiscvProcess32::initState()
     argsInit<uint32_t>(PageBytes);
     for (ContextID ctx: contextIds) {
         auto *tc = system->threads[ctx];
-        tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);
         auto *isa = dynamic_cast<ISA*>(tc->getIsaPtr());
         fatal_if(isa->rvType() != RV32, "RISC V CPU should run in 32 bits mode");
         MISA misa = tc->readMiscRegNoEffect(MISCREG_ISA);
-        fatal_if(!(misa.rvu && misa.rvs),
-            "RISC V SE mode can't run without supervisor and user "
-            "privilege modes.");
+        if (misa.rvu) {
+            // Linux user-space: run at U-mode (requires S-mode).
+            tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);
+            fatal_if(!misa.rvs,
+                "RISC V SE mode can't run without supervisor and user "
+                "privilege modes.");
+        }
+        // M-only ISA (privilege_mode_set="M"): keep PRV_M from reset so that
+        // bare-metal firmware can access M-mode CSRs (e.g. minstret, mstatus).
     }
 }
 

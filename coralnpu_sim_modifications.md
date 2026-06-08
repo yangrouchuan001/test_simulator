@@ -48,6 +48,8 @@
     - 11.3 [AttributeError: Invalid assignment for LocalBP parameter localHistoryTableSize](#113-attributeerror-invalid-assignment-for-localbp-parameter-localhistorytablesize)
     - 11.4 [Panic: Stats of the same group share the same name `opClasses`](#114-panic-stats-of-the-same-group-share-the-same-name-opclasses)
     - 11.5 [Fatal: Out of memory, please increase size of physical memory](#115-fatal-out-of-memory-please-increase-size-of-physical-memory)
+    - 11.6 [Panic: minstret is not accessible in 0](#116-panic-minstret-is-not-accessible-in-0)
+    - 11.7 [warn: Ignoring write to miscreg INSTRET / panic: Page table fault at 0x2000e4](#117-warn-ignoring-write-to-miscreg-instret--panic-page-table-fault-when-accessing-virtual-address-0x2000e4)
 
 ---
 
@@ -1213,3 +1215,291 @@ In gem5 SE mode, pool ordering is determined by the **start address** of each
 declaration order.  For a CoralNPU memory map where ITCM/DTCM have low
 addresses but small sizes, set `conf_table_reported=False` on both TCMs so
 the large gap fill (or ExtMem) becomes pool 0.
+
+---
+
+### 11.6 Panic: minstret is not accessible in 0
+
+**Full error**
+
+```
+src/arch/riscv/faults.cc:299: panic: Illegal instruction 0x10000100b0205073
+    at pc (0=>0x4).(0=>1): minstret is not accessible in 0
+```
+
+The simulation aborts at tick 0, on the second instruction executed (PC = 0x4).
+
+---
+
+#### Root cause — three-level chain
+
+**Level 1 — RISC-V ISA specification**
+
+CSR address bits [9:8] encode the minimum privilege required for access:
+
+| bits[9:8] | Value | Minimum privilege |
+|-----------|-------|------------------|
+| `00` | 0 | U-mode (accessible from any mode) |
+| `01` | 1 | S-mode or higher |
+| `10` | 2 | H-mode or higher |
+| `11` | 3 | M-mode only |
+
+`minstret` is CSR `0xB02`.  Bits [9:8] = `0b10` → minimum privilege = M-mode (PRV_M = 3).
+Any access from a lower privilege level is an illegal instruction per the spec.
+
+The failing instruction at PC = 0x4 is:
+
+```
+0xb0205073  →  csrrs x0, minstret, x0
+```
+
+(Opcode `0x73` = SYSTEM, funct3 `010` = CSRRS, CSR field = `0xB02` = minstret.
+With rd = x0 and rs1 = x0 this is a read-and-discard, used in firmware as a
+lightweight pipeline serialisation point.)
+
+**Level 2 — gem5 SE mode forces U-mode**
+
+`RiscvProcess32::initState()` in `src/arch/riscv/process.cc` unconditionally
+sets the privilege register to U-mode immediately after loading the ELF:
+
+```cpp
+// process.cc (before fix) — runs for every RV32 SE workload
+tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);    // overrides hardware reset (M-mode)
+MISA misa = tc->readMiscRegNoEffect(MISCREG_ISA);
+fatal_if(!(misa.rvu && misa.rvs),
+    "RISC V SE mode can't run without supervisor and user privilege modes.");
+```
+
+This is correct for Linux user-space programs but wrong for bare-metal firmware
+that expects to execute in M-mode throughout.
+
+**Level 3 — CSR access check fires**
+
+The CSR execute template in
+`src/arch/riscv/isa/formats/standard.isa` checks:
+
+```cpp
+auto lowestAllowedMode = (PrivilegeMode)bits(csr, 9, 8);  // 0xB02[9:8] = 2 → PRV_M = 3
+auto pm = (PrivilegeMode)xc->readMiscReg(MISCREG_PRV);    // PRV_U = 0 (set by process.cc)
+
+if (pm < lowestAllowedMode) {   // 0 < 3 → true
+    return std::make_shared<IllegalInstFault>(
+        csprintf("%s is not accessible in %s\n", csrName, pm), machInst);
+}
+```
+
+`IllegalInstFault::invokeSE()` in `faults.cc:299` converts this to a
+`panic("Illegal instruction ... : minstret is not accessible in 0")`.
+
+---
+
+#### Fix
+
+Two coordinated changes are required.
+
+**Change 1: `src/arch/riscv/process.cc`**
+
+Make the U-mode downgrade conditional on whether the MISA actually includes
+user mode (`misa.rvu`).  When MISA is M-only (`misa.rvu = 0`), the process
+stays in PRV_M (the hardware reset state), allowing M-mode CSR access.
+
+```diff
+ void RiscvProcess32::initState()
+ {
+     Process::initState();
+     argsInit<uint32_t>(PageBytes);
+     for (ContextID ctx: contextIds) {
+         auto *tc = system->threads[ctx];
+-        tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);
+         auto *isa = dynamic_cast<ISA*>(tc->getIsaPtr());
+         fatal_if(isa->rvType() != RV32, "RISC V CPU should run in 32 bits mode");
+         MISA misa = tc->readMiscRegNoEffect(MISCREG_ISA);
+-        fatal_if(!(misa.rvu && misa.rvs),
+-            "RISC V SE mode can't run without supervisor and user "
+-            "privilege modes.");
++        if (misa.rvu) {
++            tc->setMiscRegNoEffect(MISCREG_PRV, PRV_U);
++            fatal_if(!misa.rvs,
++                "RISC V SE mode can't run without supervisor and user "
++                "privilege modes.");
++        }
++        // M-only ISA: keep PRV_M from reset for bare-metal firmware.
+     }
+ }
+```
+
+The same change is applied to `RiscvProcess64::initState()`.
+This preserves existing behaviour for all Linux user-space workloads (which
+always use `privilege_mode_set="MSU"` → `misa.rvu = 1`).
+
+**Change 2: `configs/coralnpu/coralnpu_cpu.py`**
+
+Add `privilege_mode_set="M"` to `CoralNPUMinorCPU`'s ISA configuration:
+
+```diff
+ isa = [RiscvISA(
+     riscv_type        = "RV32",
+     enable_rvv        = True,
+     vlen              = 128,
+     elen              = 32,
++    privilege_mode_set = "M",   # bare-metal M-mode only; no S/U modes
+ )]
+```
+
+`PrivilegeModeSet="M"` (defined in `src/arch/riscv/RiscvISA.py`) causes
+`ISA::clear()` to leave `misa.rvu = 0` and `misa.rvs = 0`.  The patched
+`process.cc` then sees `misa.rvu = 0` and skips the U-mode downgrade,
+leaving the process in PRV_M.
+
+With `pm = PRV_M = 3`, the CSR access check `pm < lowestAllowedMode`
+becomes `3 < 3` → false → `minstret` is accessible.
+
+**Rebuild required** — `process.cc` is a C++ source file:
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
+**Why `privilege_mode_set="M"` is architecturally correct for CoralNPU**
+
+CoralNPU's scalar core implements RV32IM with M-mode privilege only — there is
+no S-mode or U-mode in the hardware.  Bare-metal firmware runs entirely in
+M-mode and freely accesses M-mode CSRs (`minstret`, `mstatus`, `mcause`, …).
+Setting `privilege_mode_set="M"` in gem5 aligns the simulation privilege model
+with the hardware reality.
+
+The gem5 SE mode features that require S/U modes (Linux syscall emulation,
+page-table-based virtual memory) are not used by CoralNPU firmware, which
+performs I/O through the `UartConsole` MMIO device and terminates via `m5_exit`
+or by reaching end-of-program.
+
+**Rule**
+
+For any gem5 SE simulation of bare-metal RISC-V firmware that runs in M-mode:
+set `privilege_mode_set="M"` in the ISA configuration.  This, combined with
+the patched `process.cc`, keeps the simulated privilege at PRV_M and allows
+unrestricted M-mode CSR access.
+
+---
+
+### 11.7 warn: Ignoring write to miscreg INSTRET / panic: Page table fault when accessing virtual address 0x2000e4
+
+After fixing problems 11.5 and 11.6 and rebuilding, two new issues appear when
+running with larger TCM sizes (e.g. `--itcm-size 1024kB --dtcm-size 1024kB`):
+
+```
+src/arch/riscv/isa.cc:707: warn: Ignoring write to miscreg INSTRET.
+src/arch/riscv/isa.cc:707: warn: Ignoring write to miscreg INSTRET.
+src/sim/faults.cc:103: panic: panic condition !handled occurred:
+    Page table fault when accessing virtual address 0x2000e4
+```
+
+---
+
+#### Warning: "Ignoring write to miscreg INSTRET"
+
+**Root cause (benign)**
+
+Firmware writes to `minstret` (CSR 0xB02) to reset the retire counter before
+timing a code region.  gem5 manages the instruction-retire counter internally
+and explicitly ignores writes to `INSTRET`/`MINSTRET` in
+`src/arch/riscv/isa.cc:707`.  The counter continues to increment correctly
+for reads.
+
+**Impact:** None.  The warning is purely informational.  The simulation remains
+correct; only the firmware's software reset of the counter is silently dropped,
+which means the counter reflects total retired instructions from the start of
+the program rather than from the firmware's chosen epoch.
+
+**Fix:** No code change required.  The warning can be suppressed in production
+runs by disabling the `Warn` debug channel, but the simulation result is
+unaffected.
+
+---
+
+#### Panic: Page table fault when accessing virtual address 0x2000e4
+
+**Root cause**
+
+VA `0x2000e4` = DTCM-start `0x100000` + DTCM-size `0x100000` (1024 kB) + 228
+bytes.  It is 228 bytes **past the end of DTCM**.
+
+The access originates from firmware code that zero-initialises BSS or accesses
+a runtime variable whose address sits just beyond the declared TCM boundary.
+On real hardware this range is valid memory; in the simulator the memory exists
+(`proc_mem` gap fill covers `0x200000–0x7FFFFFFF`) but no virtual→physical
+mapping has been established for it.
+
+The gem5 SE-mode fault path is:
+
+```
+tlb.cc (SE path, lines 582-610)
+  └─ p->pTable->translate(0x2000e4, paddr)  → false   (no mapping exists)
+      └─ GenericPageTableFault(0x2000e4)
+          └─ faults.cc:101  p->fixupFault(0x2000e4)
+              └─ mem_state.cc  MemState::fixupFault()
+                  ├─ VMA loop: 0x2000e4 not in any ELF PT_LOAD / mmap VMA
+                  ├─ stack check: 0x2000e4 < _stackMin (stack is at ~0x7FFFFFFF) → false
+                  └─ return false
+          └─ faults.cc:103  !handled → panic
+```
+
+`MemState::fixupFault()` only demand-pages addresses that are either (a) in a
+registered VMA (ELF segment, mmap), or (b) in the stack growth region.  The
+gap-fill memory (`proc_mem`) covers this address in the physical layout, but
+no VMA was ever registered for it, so `fixupFault` cannot find it and panics.
+
+**Fix: `src/sim/mem_state.cc`**
+
+Add a third fallback inside `MemState::fixupFault()`, after the stack check,
+that demand-pages any address falling within a `conf_table_reported=True`
+physical memory range.  ITCM and DTCM are excluded because they carry
+`conf_table_reported=False`; only gap fill and ExtMem appear in
+`getConfAddrRanges()`.
+
+```diff
+ // … existing stack-growth check …
+     }
+
++    // Demand-page any address within a conf-reported physical memory range
++    // (gap fill, ExtMem).  Handles bare-metal firmware accesses to addresses
++    // that were never mmap'd — e.g. BSS past a TCM boundary.
++    // ITCM/DTCM are excluded (conf_table_reported=False).
++    for (const auto &range :
++             _ownerProcess->system->getPhysMem().getConfAddrRanges()) {
++        if (range.contains(vaddr)) {
++            Addr vpage_start = roundDown(vaddr, _pageBytes);
++            _ownerProcess->allocateMem(vpage_start, _pageBytes);
++            return true;
++        }
++    }
++
+     return false;
+ }
+```
+
+**File modified:** `src/sim/mem_state.cc` — inside `MemState::fixupFault()`,
+after the `vaddr >= _stackBase - _maxStackSize` block.
+
+No new header includes are needed; `sim/system.hh` (already included) exposes
+`System::getPhysMem()`, and `PhysicalMemory::getConfAddrRanges()` is declared
+in `mem/physical.hh` (pulled in transitively).
+
+**Why this is safe for normal Linux SE workloads**
+
+For a standard gem5 Linux user-space simulation there is no physical memory
+mapped to `conf_table_reported=True` ranges near the faulting address
+(`proc_mem` does not exist in that configuration), so `getConfAddrRanges()`
+returns only ExtMem (which begins far above typical user-space addresses).  The
+new fallback loop finds no matching range and falls through to the original
+`return false`, preserving existing behaviour.
+
+**Rebuild required:**
+
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
