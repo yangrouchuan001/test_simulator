@@ -33,11 +33,14 @@
 #       Note: PMTRDT srcRelLat=3 to give same 3cy chain as ALU/MUL
 #
 #   RVV FUs (from rvv_backend_define.svh: NUM_ALU=2, NUM_MUL=2, NUM_DIV=1, NUM_PMTRDT=1):
-#     VEC_ALU    × 2  opLat=5  II=1   (2 ALUs, EX=2cy; vadd/vsub/vshift/vcmp/vmask/vslide*)
-#     VEC_MUL    × 2  opLat=5  II=1   (2 MULs, EX=2cy; vmul/vmacc/vfadd/vfmul)
+#     VEC_ALU    × 2  opLat=5  II=1   (2 ALUs; vadd/vsub/vshift/vcmp/vslide/vreduce-int)
+#     VEC_MUL    × 2  opLat=5  II=1   (2 MULs; vmul/vmacc/vfadd/vfmul/vreduce-fp)
 #     VEC_DIV    × 1  opLat=35 II=35  (1 non-pipelined DIV, EX≈32cy)
-#     VEC_PMTRDT × 1  opLat=6  II=6   (1 non-pipelined, EX=3cy; reductions only)
 #     VecLSU     × 1  opLat=5cy total (shared port, 5cy DTCM)
+#
+#   Note: PMTRDT (non-pipelined reduction/permutation) removed — gem5 MinorCPU
+#   has no scalar-vector overlap, so a non-pipelined PMTRDT causes 1.6-2.1×
+#   excess cycles vs RTL (tested §11.22-§11.23). All vector ops kept pipelined.
 #
 #   Known limitation: scalar–vector overlap (scalar core continues while
 #   RVV co-processor runs) is NOT modelled. Scalar instructions serialise
@@ -229,14 +232,12 @@ _CoralNPU_VecLSU = MinorFU(
 # ════════════════════════════════════════════════════════════════════════════
 
 # VEC_ALU × 2 — integer arithmetic, logic, shift, compare, convert, mask ops,
-#               vsetvl* configuration, and permutations (vslide*/vrgather).
+#               reductions, permutations (vslide*/vrgather), and vsetvl* config.
 # opLat=5 (3 overhead + 2 EX). II=1 (pipelined). srcRelLats=[2,2] → v-to-v=3cy.
-# NOTE: reductions (SimdReduce*) are handled by the single non-pipelined
-#       VEC_PMTRDT unit below. Permutations (SimdExt/SimdFloat*Ext) are placed
-#       here (pipelined) to compensate for gem5's missing scalar-vector overlap:
-#       RTL runs permutations in PMTRDT at II=6, but concurrently with the scalar
-#       core; without that overlap modelled in gem5, using II=6 here causes ~2×
-#       excess cycles. Pipelined permutations in VEC_ALU restore timing accuracy.
+# NOTE: gem5 MinorCPU has no scalar-vector overlap, so all vector ops are kept
+#       pipelined here (II=1) to avoid overcounting stalls that the RTL hides
+#       via concurrent scalar execution. A separate non-pipelined PMTRDT FU was
+#       tried (§11.22-§11.23) but caused 1.6-2.1× excess cycles vs RTL.
 def _make_CoralNPU_VEC_ALU():
     return MinorFU(
         opClasses=_make_op_class_set([
@@ -250,6 +251,8 @@ def _make_CoralNPU_VEC_ALU():
             "SimdConfig",       # vsetvl, vsetvli, vsetivli
             "SimdExt",          # vslideup, vslidedown, vslide1up, vslide1down, vrgather
             "SimdFloatExt",     # vfslide1up, vfslide1down, vfrgather
+            "SimdReduceAlu",    # vredand, vredor, vredxor, vredmin/u, vredmax/u
+            "SimdReduceCmp",    # vredminu, vredmaxu
         ]),
         opLat=5,
         issueLat=1,
@@ -259,9 +262,9 @@ def _make_CoralNPU_VEC_ALU():
         )],
     )
 
-# VEC_MUL × 2 — integer multiply/MAC, dot-product, float arithmetic.
+# VEC_MUL × 2 — integer multiply/MAC, dot-product, float arithmetic, and
+#               float/integer reductions (pipelined; see VEC_ALU comment).
 # opLat=5 (3 overhead + 2 EX). II=1 (pipelined). srcRelLats=[2,2] → v-to-v=3cy.
-# NOTE: float reductions (SimdFloatReduce*) go to VEC_PMTRDT (non-pipelined).
 def _make_CoralNPU_VEC_MUL():
     return MinorFU(
         opClasses=_make_op_class_set([
@@ -269,7 +272,8 @@ def _make_CoralNPU_VEC_MUL():
             "SimdMultAcc",          # vmacc, vnmsac, vmadd, vnmsub
             "SimdAddAcc",           # vsadd, vsaddu, vssub, vssubu (saturating)
             "SimdDotProd",          # vdot (if available)
-            # Floating-point (routes through RVV co-processor's MUL pipeline)
+            "SimdReduceAdd",        # vredsum, vwredsum, vwredsumu
+            # Floating-point
             "SimdFloatAdd",         # vfadd, vfsub, vfrsub
             "SimdFloatAlu",         # vfsgnj, vfsgnjn, vfsgnjx, vfmin, vfmax
             "SimdFloatCmp",         # vmfeq, vmfne, vmflt, vmfle, vmfgt, vmfge
@@ -277,6 +281,8 @@ def _make_CoralNPU_VEC_MUL():
             "SimdFloatMisc",        # vfmerge, vfmv.*
             "SimdFloatMult",        # vfmul, vfwmul
             "SimdFloatMultAcc",     # vfmacc, vfnmacc, vfmsac, vfnmsac, vfmadd, vfnmadd
+            "SimdFloatReduceAdd",   # vfredosum, vfredusum, vfwredosum
+            "SimdFloatReduceCmp",   # vfredmin, vfredmax
         ]),
         opLat=5,
         issueLat=1,
@@ -299,38 +305,6 @@ _CoralNPU_VEC_DIV = MinorFU(
     opLat=35,
     issueLat=35,
     timings=[MinorFUTiming(description="CoralNPU_VEC_DIV", srcRegsRelativeLats=[0, 0])],
-)
-
-# VEC_PMTRDT × 1 — Reduce / Tree unit (single non-pipelined instance).
-#
-# RTL source: rvv_backend_pmtrdt_unit.sv, _reduction.sv  (NUM_PMTRDT=1)
-# EX latency (VLEN=128): 3 cy  (binary-tree depth = log2(128/8/4) + 2 = 3)
-# Total: 3 cy overhead + 3 cy EX = 6 cy.
-# II = 6 (non-pipelined: next reduction waits for current to finish).
-# v-to-v chain penalty = opLat - srcRelLat = 6 - 3 = 3 cy
-#   (same 3-cycle penalty as ALU/MUL — ROB bypass fires 1 cy before VRF write).
-#
-# Covers reductions only; permutations (SimdExt/SimdFloatExt) are in VEC_ALU
-# to compensate for gem5's missing scalar-vector overlap (see VEC_ALU comment).
-#
-#   Reductions: vredsum, vredand, vredor, vredxor, vredmin/u, vredmax/u,
-#               vwredsum/u, vfredosum, vfredusum, vfredmin, vfredmax
-_CoralNPU_VEC_PMTRDT = MinorFU(
-    opClasses=_make_op_class_set([
-        # Integer reductions
-        "SimdReduceAlu",        # vredand, vredor, vredxor, vredmin/u, vredmax/u
-        "SimdReduceCmp",        # vredminu, vredmaxu (comparison-tree variants)
-        "SimdReduceAdd",        # vredsum, vwredsum, vwredsumu
-        # Float reductions
-        "SimdFloatReduceAdd",   # vfredosum, vfredusum, vfwredosum, vfwredusum
-        "SimdFloatReduceCmp",   # vfredmin, vfredmax
-    ]),
-    opLat=6,
-    issueLat=6,     # non-pipelined: II = opLat
-    timings=[MinorFUTiming(
-        description="CoralNPU_VEC_PMTRDT",
-        srcRegsRelativeLats=[3, 3],   # chain penalty = 6 - 3 = 3 cy (= ALU/MUL penalty)
-    )],
 )
 
 
@@ -356,7 +330,6 @@ CoralNPU_FUPool = MinorFUPool(funcUnits=[
     _make_CoralNPU_VEC_MUL(),   # RVV MUL instance 0  (NUM_MUL=2 in RTL)
     _make_CoralNPU_VEC_MUL(),   # RVV MUL instance 1
     _CoralNPU_VEC_DIV,          # RVV DIV instance 0  (NUM_DIV=1 in RTL)
-    _CoralNPU_VEC_PMTRDT,       # RVV PMTRDT instance 0  (NUM_PMTRDT=1 in RTL)
 ])
 
 

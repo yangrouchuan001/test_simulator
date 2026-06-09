@@ -3169,3 +3169,41 @@ Reductions stay in PMTRDT (RTL-accurate, II=6) — they are mostly data-latency-
 **Files modified (Python only — no rebuild required):**
 - configs/coralnpu/coralnpu_cpu.py
 
+
+
+---
+
+### 11.24 PMTRDT removed — all vector ops restored to pipelined VEC_ALU / VEC_MUL
+
+**Context**
+
+§11.22 added a non-pipelined VEC_PMTRDT FU (issueLat=6) for reductions and permutations.
+§11.23 partially reverted by moving permutations back to VEC_ALU.
+
+**Results after each attempt:**
+
+| Config | Cycles | vs RTL |
+|---|---|---|
+| Before §11.22 (all pipelined, delay=1) | 5,505,239 | 0.89× |
+| RTL | 6,163,833 | 1.00× |
+| §11.22 (reductions+slides in PMTRDT II=6, delay=2) | 12,965,675 | 2.10× |
+| §11.23 (slides back to VEC_ALU, reductions in PMTRDT, delay=2) | 9,966,879 | 1.62× |
+
+**Root cause of failure**
+
+gem5 MinorCPU has no scalar-vector pipeline overlap. In RTL, the scalar core
+continues executing during PMTRDT operations (6-cycle II). In gem5, scalar
+instructions stall behind vector ops. This means a non-pipelined PMTRDT always
+overcounts stalls vs RTL, regardless of which ops are placed there.
+
+**Fix — configs/coralnpu/coralnpu_cpu.py**
+
+VEC_PMTRDT FU removed entirely. Reductions restored to pipelined FUs:
+
+- VEC_ALU: added back SimdReduceAlu, SimdReduceCmp (vredand/or/xor/min/max)
+- VEC_MUL: added back SimdReduceAdd, SimdFloatReduceAdd, SimdFloatReduceCmp (vredsum, vfredsum etc.)
+
+SimdExt and SimdFloatExt (vslide*, vfslide*, vrgather) remain in VEC_ALU (added in §11.23).
+
+**Files modified (Python only — no rebuild required):**
+- configs/coralnpu/coralnpu_cpu.py
