@@ -34,7 +34,7 @@
 #   m5out/stats.txt          — cycle count, IPC, cache miss rates, FU occupancy
 #   m5out/config.ini         — full configuration snapshot
 #   m5out/ftrace.system.cpu  — raw per-function trace (only when --profile is set)
-#   m5out/stats.txt          — function profile table appended after gem5 stats (--profile only)
+#   m5out/profile.txt        — per-function cycle table (only when --profile is set)
 
 import argparse
 import os
@@ -102,7 +102,7 @@ def parse_args():
     p.add_argument("--profile", action="store_true",
                    help="Enable per-function cycle profiling. gem5 writes "
                         "m5out/ftrace.system.cpu on each function-boundary "
-                        "crossing; a sorted summary is appended to stats.txt.")
+                        "crossing; a sorted summary is written to profile.txt.")
     # gem5 passes --outdir itself; we leave it to gem5's option parser.
     return p.parse_args()
 
@@ -411,44 +411,44 @@ def main():
             _hz = 1e9  # fallback: assume 1 GHz
 
         _outdir = m5.options.outdir if hasattr(m5, "options") else "m5out"
-        _ftrace = os.path.join(_outdir, "ftrace.system.cpu")
-        _stats  = os.path.join(_outdir, "stats.txt")
+        _ftrace  = os.path.join(_outdir, "ftrace.system.cpu")
+        _profile = os.path.join(_outdir, "profile.txt")
         _ftrace_exists = os.path.isfile(_ftrace)
         _ftrace_size   = os.path.getsize(_ftrace) if _ftrace_exists else 0
         _rows = _parse_ftrace(_ftrace, int(_hz)) if _ftrace_exists else []
 
-        with open(_stats, "a") as _f:
+        with open(_profile, "w") as _f:
+            _f.write(f"# CoralNPU Function Profile\n")
+            _f.write(f"# Binary : {args.cmd}\n")
+            _f.write(f"# Clock  : {args.freq}\n")
+            _f.write(f"# Ticks  : {m5.curTick()}\n")
+            _f.write(f"# CPU    : {'AtomicSimpleCPU' if args.cpu == 'atomic' else 'CoralNPUMinorCPU'}\n")
+            _f.write(f"\n")
             if _rows:
                 _total_cy = sum(r[1] for r in _rows)
-                _f.write(f"\n---------- Function Profile "
-                         f"({len(_rows)} functions) ----------\n")
-                _f.write(f"  {'Function':<40} {'Cycles':>12} {'%':>6} {'Calls':>8}\n")
-                _f.write(f"  {'-'*40} {'-'*12} {'-'*6} {'-'*8}\n")
+                _f.write(f"{'Function':<40} {'Cycles':>12} {'%':>6} {'Calls':>8}\n")
+                _f.write(f"{'-'*40} {'-'*12} {'-'*6} {'-'*8}\n")
                 for _fn, _cy, _cnt in _rows:
                     _pct = 100.0 * _cy / _total_cy if _total_cy else 0
-                    _f.write(f"  {_fn:<40} {_cy:>12,} {_pct:>5.1f}% {_cnt:>8,}\n")
-                _f.write(f"  {'-'*40} {'-'*12} {'-'*6} {'-'*8}\n")
-                _f.write(f"  {'TOTAL':<40} {_total_cy:>12,} {'100.0%':>6}\n")
-                _f.write(f"\n---------- End Function Profile ----------\n")
+                    _f.write(f"{_fn:<40} {_cy:>12,} {_pct:>5.1f}% {_cnt:>8,}\n")
+                _f.write(f"{'-'*40} {'-'*12} {'-'*6} {'-'*8}\n")
+                _f.write(f"{'TOTAL':<40} {_total_cy:>12,} {'100.0%':>6}\n")
                 print(f"[coralnpu_se] Function profile ({len(_rows)} functions) "
-                      f"appended to {_stats}\n")
+                      f"written to {_profile}\n")
             elif not _ftrace_exists:
-                _f.write(f"\n# Function profile: ftrace file not found "
-                         f"({_ftrace})\n"
-                         f"# Rebuild gem5 is required — "
-                         f"src/cpu/minor/execute.cc was modified to add "
-                         f"traceFunctions support for MinorCPU.\n")
+                _f.write(f"# No profile data: {_ftrace} not found.\n")
+                _f.write(f"# Rebuild gem5 — src/cpu/minor/execute.cc was patched "
+                         f"to add traceFunctions for MinorCPU.\n")
                 print(f"[coralnpu_se] Profile: {_ftrace} not found — "
                       f"rebuild gem5 (MinorCPU traceFunctions patch).\n")
             else:
-                _f.write(f"\n# Function profile: ftrace file is empty or has no "
-                         f"parseable symbols ({_ftrace}, {_ftrace_size} bytes)\n"
-                         f"# Check that the ELF binary has a symbol table "
-                         f"(not stripped).\n")
-                print(f"[coralnpu_se] Profile: {_ftrace} exists ({_ftrace_size} B) "
-                      f"but contains no function-boundary records.\n"
-                      f"  Check the ELF has symbols: "
-                      f"riscv32-unknown-elf-nm {args.cmd} | head\n")
+                _f.write(f"# No profile data: {_ftrace} is empty "
+                         f"({_ftrace_size} bytes).\n")
+                _f.write(f"# Check ELF has symbols: "
+                         f"riscv32-unknown-elf-nm {args.cmd} | head\n")
+                print(f"[coralnpu_se] Profile: {_ftrace} ({_ftrace_size} B) "
+                      f"has no function records. "
+                      f"Check ELF symbols with nm.\n")
 
 
 if __name__ == "__m5_main__":

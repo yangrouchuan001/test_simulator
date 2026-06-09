@@ -2798,7 +2798,10 @@ A formatted table is appended to `stats.txt`:
 
 Output:
 - `m5out/ftrace.system.cpu` — raw trace (one line per function boundary crossing)
-- `m5out/stats.txt` — function profile table appended after the standard gem5 stats block
+- `m5out/profile.txt` — per-function cycle table (written fresh each run)
+
+Note: `stats.txt` cannot be used because gem5's atexit stats dump opens it in
+write mode after `main()` returns, which would overwrite anything appended earlier.
 
 **Notes:**
 - The ELF binary must retain symbols (compiled without `-s` / `--strip-all`).
