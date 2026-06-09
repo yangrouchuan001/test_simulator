@@ -38,7 +38,9 @@
 #include "arch/riscv/regs/misc.hh"
 #include "arch/riscv/semihosting.hh"
 #include "arch/riscv/utility.hh"
+#include "base/cprintf.hh"
 #include "cpu/static_inst.hh"
+#include "sim/sim_exit.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -106,6 +108,13 @@ SystemOp::executeEBreakOrSemihosting(ExecContext *xc) const
     MISA misa = xc->readMiscReg(MISCREG_ISA);
     bool virtualized = misa.rvh ? virtualizationEnabled(xc) : false;
     return std::make_shared<BreakpointFault>(xc->pcState(), virtualized);
+}
+
+Fault
+SystemOp::executeMpause(ExecContext *xc) const
+{
+    exitSimLoop(csprintf("mpause @ %#x", xc->pcState().instAddr()), 0);
+    return NoFault;
 }
 
 } // namespace RiscvISA

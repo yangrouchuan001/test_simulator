@@ -83,6 +83,7 @@ class SystemOp : public RiscvStaticInst
 
   protected:
     Fault executeEBreakOrSemihosting(ExecContext *xc) const;
+    Fault executeMpause(ExecContext *xc) const;
 };
 
 /**

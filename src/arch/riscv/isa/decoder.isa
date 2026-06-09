@@ -1333,7 +1333,9 @@ decode QUADRANT default Unknown::unknown() {
             }
         }
 
-        0x02: SystemOp::mpause({{ }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
+        0x02: SystemOp::mpause({{
+            return executeMpause(xc);
+        }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
 
         0x03: decode FUNCT3 {
             format FenceOp {

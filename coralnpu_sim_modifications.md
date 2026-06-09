@@ -61,6 +61,7 @@
     - 11.16 [printf output missing in MinorCPU timing mode — MMIO identity-map created cacheable, stores absorbed by L1D cache](#1116-printf-output-missing-in-minorcpu-timing-mode--mmio-identity-map-created-cacheable-stores-absorbed-by-l1d-cache)
     - 11.17 [gem5 cycle count lower than Verilator — vector load latency underestimated (shared scalar LSU timing)](#1117-gem5-cycle-count-lower-than-verilator--vector-load-latency-underestimated-shared-scalar-lsu-timing)
     - 11.18 [Function-level cycle profiling — `--profile` flag added to coralnpu_se.py](#1118-function-level-cycle-profiling--profile-flag-added-to-coralnpu_sepy)
+    - 11.19 [mpause exits simulation cleanly — `executeMpause` added to SystemOp](#1119-mpause-exits-simulation-cleanly--executempause-added-to-systemop)
 
 ---
 
@@ -68,7 +69,9 @@
 
 | File | Type | Purpose |
 |------|------|---------|
-| `src/arch/riscv/isa/decoder.isa` | **Modified** | Decode `mpause` via existing `SystemOp` format (custom-0, `0x0000000B`) |
+| `src/arch/riscv/isa/decoder.isa` | **Modified** | Decode `mpause` via existing `SystemOp` format (custom-0, `0x0000000B`); (§11.19) call `executeMpause` to exit simulation cleanly |
+| `src/arch/riscv/insts/standard.hh` | **Modified** | (§11.19) Declare `SystemOp::executeMpause` |
+| `src/arch/riscv/insts/standard.cc` | **Modified** | (§11.19) Implement `executeMpause`: calls `exitSimLoop("mpause @ PC", 0)` |
 | `src/dev/coralnpu/uart_console.hh` | **New** | `UartConsole` SimObject header |
 | `src/dev/coralnpu/uart_console.cc` | **New** | `UartConsole` implementation — prints bytes on write |
 | `src/dev/coralnpu/UartConsole.py` | **New** | gem5 Python param class for `UartConsole` |
@@ -2817,3 +2820,75 @@ write mode after `main()` returns, which would overwrite anything appended earli
 **Files modified:**
 - `src/cpu/minor/execute.cc`  — add `cpu.traceFunctions(inst->pc->instAddr())` in `doInstCommitAccounting` (**rebuild required**)
 - `configs/coralnpu/coralnpu_se.py`  — `--profile` flag, `cpu.function_trace = True`, `_parse_ftrace()` summary (Python only — no rebuild required)
+
+---
+
+### 11.19 `mpause` exits simulation cleanly — `executeMpause` added to `SystemOp`
+
+**Problem**
+
+`mpause` (`0x0000000B`) was a no-op: its execute body was empty (`{{ }}`), so
+firmware using `mpause` as a simulation exit point had no effect — the
+simulator continued running past it.
+
+**Design**
+
+`mpause` should exit the simulator the same way `ebreak` does, but with a
+distinct exit cause so the two can be told apart in the terminal output and
+in `stats.txt`.
+
+The existing pattern in the codebase is:
+- `ebreak` → calls `executeEBreakOrSemihosting(xc)` → raises `BreakpointFault`
+  → `BreakpointFault::invokeSE` → `exitSimLoop("ebreak @ PC", 0)`
+- `mpause` → new `executeMpause(xc)` → `exitSimLoop("mpause @ PC", 0)` directly
+
+`mpause` does not go through a fault because it is not a RISC-V architectural
+exception — it is a CoralNPU-specific simulator synchronisation point.
+`exitSimLoop` schedules the stop event; `NoFault` is returned so the pipeline
+drains normally before the event fires.
+
+**Fix**
+
+**`src/arch/riscv/insts/standard.hh`** — declaration:
+
+```cpp
+  protected:
+    Fault executeEBreakOrSemihosting(ExecContext *xc) const;
+    Fault executeMpause(ExecContext *xc) const;   // ← added
+```
+
+**`src/arch/riscv/insts/standard.cc`** — includes added, implementation added:
+
+```cpp
+// new includes
+#include "base/cprintf.hh"
+#include "sim/sim_exit.hh"
+
+// new function (before closing namespace)
+Fault
+SystemOp::executeMpause(ExecContext *xc) const
+{
+    exitSimLoop(csprintf("mpause @ %#x", xc->pcState().instAddr()), 0);
+    return NoFault;
+}
+```
+
+**`src/arch/riscv/isa/decoder.isa`** — execute body changed:
+
+```diff
+-        0x02: SystemOp::mpause({{ }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
++        0x02: SystemOp::mpause({{
++            return executeMpause(xc);
++        }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
+```
+
+**Exit message** shown by `coralnpu_se.py`:
+
+```
+[coralnpu_se] Exit: mpause @ 0x12c
+```
+
+**Files modified (rebuild required):**
+- `src/arch/riscv/insts/standard.hh`
+- `src/arch/riscv/insts/standard.cc`
+- `src/arch/riscv/isa/decoder.isa`
