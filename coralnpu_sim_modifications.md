@@ -60,6 +60,7 @@
     - 11.15 [Missing output and stats — simulation exits via SIGTRAP when firmware uses ebreak as exit](#1115-missing-output-and-stats--simulation-exits-via-sigtrap-when-firmware-uses-ebreak-as-exit)
     - 11.16 [printf output missing in MinorCPU timing mode — MMIO identity-map created cacheable, stores absorbed by L1D cache](#1116-printf-output-missing-in-minorcpu-timing-mode--mmio-identity-map-created-cacheable-stores-absorbed-by-l1d-cache)
     - 11.17 [gem5 cycle count lower than Verilator — vector load latency underestimated (shared scalar LSU timing)](#1117-gem5-cycle-count-lower-than-verilator--vector-load-latency-underestimated-shared-scalar-lsu-timing)
+    - 11.18 [Function-level cycle profiling — `--profile` flag added to coralnpu_se.py](#1118-function-level-cycle-profiling--profile-flag-added-to-coralnpu_sepy)
 
 ---
 
@@ -74,7 +75,7 @@
 | `src/dev/coralnpu/SConscript` | **New** | Build registration for the UART device |
 | `configs/coralnpu/__init__.py` | **New** | Python package marker |
 | `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU into `ScalarLSU` (2 cy) and `VecLSU` (5 cy) to match RTL latencies |
-| `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, and `system.cache_line_size=32` |
+| `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, `system.cache_line_size=32`, and `--profile` for per-function cycle profiling |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | (§11.13) Pass RV32-masked `vaddr` to `GenericPageTableFault`; (§11.16) SE translate path uses `pTable->lookup()` to read `Uncacheable` flag and sets `Request::UNCACHEABLE` so MMIO stores bypass the L1D cache |
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
@@ -2669,3 +2670,104 @@ approximates the RTL formula.
 | AXI protocol overhead (even at `axi_delay_ns=0`) | gem5 faster | Add realistic ext_mem latency |
 | PMTRDT non-pipelined (reduction/permutation) | gem5 faster | Separate non-pipelined VEC_PMTRDT FU |
 | Scalar-vector overlap not modeled | gem5 slower | Not straightforward in MinorCPU |
+
+---
+
+### 11.18 Function-level cycle profiling — `--profile` flag added to `coralnpu_se.py`
+
+**Problem**
+
+There was no way to measure how many cycles each firmware function consumed
+during simulation.  Knowing per-function cycle counts is necessary to identify
+hot spots that warrant microarchitectural optimisation and to correlate gem5
+timing with RTL profiles.
+
+**gem5 built-in mechanism**
+
+`BaseCPU` already includes a built-in function tracer:
+
+| Parameter | Location | Default |
+|-----------|----------|---------|
+| `function_trace` | `src/cpu/BaseCPU.py:115` | `False` |
+| `function_trace_start` | `src/cpu/BaseCPU.py:116` | `0` (start of simulation) |
+
+When `function_trace = True`, gem5 writes `m5out/ftrace.<cpu_name>` on every
+function-boundary PC crossing using the ELF symbol table already loaded at
+simulation start.
+
+**ftrace file format** (from `src/cpu/base.cc`):
+
+```
+TICK: FUNCNAME (DURATION_TICKS_OF_FUNCNAME)
+```
+
+Each line records the tick at which a new function was entered, followed by
+the duration (in ps ticks) that was spent in the *previous* function.  The
+pattern `re.findall(r'\d+:\s+(\S+)\s+\((\d+)\)', content)` extracts
+`(funcname, duration)` pairs for each crossing.
+
+**Fix — `configs/coralnpu/coralnpu_se.py`**
+
+Three changes were made (Python only — no C++ rebuild required):
+
+**1. New `--profile` argument in `parse_args()`:**
+
+```python
+p.add_argument("--profile", action="store_true",
+               help="Enable per-function cycle profiling. gem5 writes "
+                    "m5out/ftrace.system.cpu on each function-boundary "
+                    "crossing; a sorted summary is printed at exit.")
+```
+
+**2. Enable function tracing on the CPU in `build_system()`:**
+
+```python
+if args.profile:
+    cpu.function_trace = True
+    cpu.function_trace_start = 0
+```
+
+**3. `_parse_ftrace()` helper + post-simulation summary in `main()`:**
+
+`_parse_ftrace(ftrace_path, tick_freq_hz)` reads the ftrace file, accumulates
+ticks-per-function, converts to cycles using `ticks_per_cycle = 10^12 / freq_hz`
+(gem5 tick resolution is 1 ps), and returns a list sorted by total cycles
+descending.
+
+After `m5.simulate()` returns, `main()` calls this helper and prints a
+formatted table of the top 40 functions:
+
+```
+[coralnpu_se] ── Function Profile (N functions) ──
+  Function                                    Cycles        %    Calls
+  ---------------------------------------- ---------- ------ --------
+  matrix_multiply                            12 345 000  45.2%      100
+  vector_dot                                  8 200 000  30.1%      800
+  ...
+  TOTAL                                      27 300 000  100.0%
+```
+
+**Usage:**
+
+```bash
+./build/RISCV/gem5.opt configs/coralnpu/coralnpu_se.py \
+    --cmd firmware.elf --profile
+```
+
+Output:
+- `m5out/ftrace.system.cpu` — raw trace (one line per function boundary crossing)
+- Terminal — sorted per-function cycle table (top 40 by cycle count)
+
+**Notes:**
+- The ELF binary must retain symbols (compiled without `-s` / `--strip-all`).
+  Debug symbols (`-g`) are not required — only the function symbol table.
+- `function_trace_start=0` starts tracing from tick 0 (beginning of simulation).
+  Set to a later tick to skip startup if needed.
+- Works with both `--cpu atomic` and `--cpu minor`.  In atomic mode, "cycles"
+  correspond to the tick-based retired-instruction count rather than true pipeline
+  timing; use `--cpu minor` for cycle-accurate profiling.
+- The output file name is always `ftrace.system.cpu` because the CPU is named
+  `system.cpu` in the gem5 object hierarchy.
+
+**Files modified:**
+- `configs/coralnpu/coralnpu_se.py`  (Python only — no rebuild required)

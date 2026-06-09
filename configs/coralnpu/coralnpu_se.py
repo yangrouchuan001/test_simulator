@@ -15,6 +15,7 @@
 #       [--dtcm-start 0x10000] [--dtcm-size 32kB]            \
 #       [--ext-mem-start 0x80000000] [--ext-mem-size 256MB]   \
 #       [--max-insts N]                                       \
+#       [--profile]                                           \
 #       [--outdir m5out]
 #
 # CPU models
@@ -30,8 +31,9 @@
 #
 # Statistics output
 # -----------------
-#   m5out/stats.txt  — cycle count, IPC, cache miss rates, FU occupancy
-#   m5out/config.ini — full configuration snapshot
+#   m5out/stats.txt          — cycle count, IPC, cache miss rates, FU occupancy
+#   m5out/config.ini         — full configuration snapshot
+#   m5out/ftrace.system.cpu  — per-function trace (only when --profile is set)
 
 import argparse
 import os
@@ -96,6 +98,10 @@ def parse_args():
                    help="MMIO address of the UART TX register used by firmware "
                         "printf (e.g. 'sb c, <addr>'). Set to 'none' to "
                         "disable the UART console device.")
+    p.add_argument("--profile", action="store_true",
+                   help="Enable per-function cycle profiling. gem5 writes "
+                        "m5out/ftrace.system.cpu on each function-boundary "
+                        "crossing; a sorted summary is printed at exit.")
     # gem5 passes --outdir itself; we leave it to gem5's option parser.
     return p.parse_args()
 
@@ -174,6 +180,10 @@ def build_system(args):
 
     if args.max_insts > 0:
         cpu.max_insts_any_thread = args.max_insts
+
+    if args.profile:
+        cpu.function_trace = True
+        cpu.function_trace_start = 0
 
     system.cpu = cpu
     cpu.createInterruptController()
@@ -305,6 +315,52 @@ def build_system(args):
     return system
 
 
+# ── Function-trace profiler ──────────────────────────────────────────────────
+
+def _parse_ftrace(ftrace_path, tick_freq_hz):
+    """Parse gem5 function_trace output and return a summary dict.
+
+    ftrace format (one entry per function-boundary crossing):
+        " (<duration_ticks>)\n<current_tick>: <func_name>"
+
+    Returns a list of (func_name, total_cycles, call_count) sorted by
+    total_cycles descending.  tick_freq_hz converts ticks to cycles.
+    """
+    from collections import defaultdict
+
+    ticks_per_cycle = 1000 if tick_freq_hz == 0 else (10**12 // tick_freq_hz)
+
+    totals = defaultdict(int)   # func_name -> total ticks spent in it
+    counts = defaultdict(int)   # func_name -> call count
+
+    try:
+        with open(ftrace_path) as f:
+            content = f.read()
+    except FileNotFoundError:
+        return []
+
+    # Each record looks like: " (DURATION)\nTICK: FUNCNAME"
+    # We split on ")\n" to pair duration with the function that was *leaving*.
+    # The leaving function's duration is captured in parentheses just before
+    # the next function name.  We collect name→duration pairs.
+    import re
+    # Pattern: optional leading text, then "TICK: FUNCNAME (DURATION)"
+    # gem5 writes: "TICK: FUNCNAME (DURATION_OF_FUNCNAME)\nNEXT_TICK: NEXT_FUNC"
+    # So DURATION follows the function name it belongs to.
+    records = re.findall(r'\d+:\s+(\S+)\s+\((\d+)\)', content)
+    for func_name, duration_str in records:
+        duration = int(duration_str)
+        cycles = max(1, duration // ticks_per_cycle)
+        totals[func_name] += cycles
+        counts[func_name] += 1
+
+    return sorted(
+        [(fn, totals[fn], counts[fn]) for fn in totals],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -331,6 +387,8 @@ def main():
         print(f"[coralnpu_se]   Limit  : {args.max_insts} instructions")
     if args.uart_addr.lower() != "none":
         print(f"[coralnpu_se]   UART   : {args.uart_addr}  (printf MMIO console)")
+    if args.profile:
+        print(f"[coralnpu_se]   Profile: enabled  (m5out/ftrace.system.cpu)")
     print()
 
     exit_event = m5.simulate()
@@ -338,6 +396,42 @@ def main():
     print(f"\n[coralnpu_se] Exit: {exit_event.getCause()}")
     print(f"[coralnpu_se] Ticks simulated: {m5.curTick()}")
     print(f"[coralnpu_se] Stats written to m5out/stats.txt\n")
+
+    if args.profile:
+        # gem5 uses 1 ps ticks; 1 GHz clock = 1000 ticks/cycle.
+        # We derive ticks_per_cycle from the simulated frequency string rather
+        # than hardcoding so it works at any --freq value.
+        import re as _re
+        _m = _re.match(r'([\d.]+)\s*(GHz|MHz|kHz|Hz)', args.freq, _re.I)
+        if _m:
+            _val, _unit = float(_m.group(1)), _m.group(2).upper()
+            _hz = _val * {"GHZ": 1e9, "MHZ": 1e6, "KHZ": 1e3, "HZ": 1.0}[_unit]
+        else:
+            _hz = 1e9  # fallback: assume 1 GHz
+        _ticks_per_cycle = int(round(1e12 / _hz))  # gem5 tick = 1 ps
+
+        _outdir = m5.options.outdir if hasattr(m5, "options") else "m5out"
+        _ftrace = os.path.join(_outdir, "ftrace.system.cpu")
+        _rows = _parse_ftrace(_ftrace, int(_hz))
+
+        if _rows:
+            _total_cy = sum(r[1] for r in _rows)
+            print(f"[coralnpu_se] ── Function Profile ({'%d' % len(_rows)} functions) ──")
+            print(f"  {'Function':<40} {'Cycles':>10} {'%':>6} {'Calls':>8}")
+            print(f"  {'-'*40} {'-'*10} {'-'*6} {'-'*8}")
+            for _fn, _cy, _cnt in _rows[:40]:  # top 40
+                _pct = 100.0 * _cy / _total_cy if _total_cy else 0
+                print(f"  {_fn:<40} {_cy:>10,} {_pct:>5.1f}% {_cnt:>8,}")
+            if len(_rows) > 40:
+                _rest_cy = sum(r[1] for r in _rows[40:])
+                _rest_pct = 100.0 * _rest_cy / _total_cy if _total_cy else 0
+                print(f"  {'... (%d more)' % (len(_rows)-40):<40} "
+                      f"{_rest_cy:>10,} {_rest_pct:>5.1f}%")
+            print(f"  {'TOTAL':<40} {_total_cy:>10,} {'100.0%':>6}")
+            print()
+        else:
+            print(f"[coralnpu_se] Profile: no data in {_ftrace} "
+                  f"(check ELF has symbols and --profile was set)\n")
 
 
 if __name__ == "__m5_main__":
