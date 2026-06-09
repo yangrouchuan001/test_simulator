@@ -17,7 +17,8 @@
 #     MLU  × 1   latency=3  II=1  (pipelined shared multiplier)
 #     DVU  × 1   latency=34 II=34 (non-pipelined divider, lane-0 only in HW)
 #     FPU  × 1   latency=3  II=1  (pipelined, slot-0 only in HW)
-#     LSU  × 1   latency=1  extraAssumedLat=2 (1 mem op/cycle, ≥2cy loads)
+#     ScalarLSU × 1  latency=1  extraAssumedLat=1  (2cy total; RTL: 1addr+1SRAM)
+#     VecLSU    × 1  latency=1  extraAssumedLat=4  (5cy total; RTL: 3ovhd+2EX)
 #     CSR  × 1   latency=1  serialising
 #
 # RVV co-processor (Level-2 approximate timing)
@@ -133,46 +134,63 @@ _CoralNPU_CSR = MinorFU(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# LSU — shared by scalar and vector memory operations
+# LSU — separate scalar and vector slots to match RTL latencies
 # ════════════════════════════════════════════════════════════════════════════
+#
+# RTL latency (pipeline_and_instructions.md):
+#
+#   Scalar DTCM load:  2 cy  (E1: address calc; E2: SRAM response)
+#     → opLat=1 + extraAssumedLat=1 = 2 cy total
+#
+#   Vector DTCM load:  3 cy overhead (DE2-FF + ROB-FF + VRF-FF)
+#                    + ceil(vl × EEW_bytes / 32) × (1 + memory_cycles)
+#     For vl=4, EEW=32, VLEN=128, DTCM (memory_cycles=1):
+#       = 3 + ceil(16B/32B) × 2 = 3 + 1×2 = 5 cy
+#     → opLat=1 + extraAssumedLat=4 = 5 cy total
+#
+# gem5's MinorCPU dispatches scalar and vector memory ops through
+# independent FU pool slots; having two separate entries lets the
+# scoreboard apply the correct latency to each class.
 
-# LSU — 1 slot (queue depth 8 in HW).
-#
-# Scalar ops:
-#   opLat=1: address calculation.
-#   extraAssumedLat=2: scoreboard holds load dest for 2 extra cycles
-#   (total 3 cy from issue = 1-cy SRAM + 1 pipeline reg + sign-extend).
-#
-# Vector memory ops (RVV):
-#   All RVV load/store patterns are routed through the same LSU slot.
-#   gem5 models vector memory as a sequence of scalar-width transactions
-#   through the D-cache; the latency visible to the scoreboard is the
-#   same opLat+extraAssumedLat as scalar loads.  Strided and indexed
-#   patterns incur additional latency from address-generation iterations,
-#   modelled implicitly by gem5's LSQ state machine.
-_CoralNPU_LSU = MinorFU(
+# Scalar LSU — 2-cycle DTCM latency (1 addr + 1 SRAM).
+_CoralNPU_ScalarLSU = MinorFU(
     opClasses=_make_op_class_set([
-        # ── Scalar memory ────────────────────────────────────────────────
         "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
-        # ── Vector memory (all RVV access patterns) ──────────────────────
-        "SimdUnitStrideLoad",              # vle<eew>.v
-        "SimdUnitStrideStore",             # vse<eew>.v
-        "SimdUnitStrideMaskLoad",          # vlm.v
-        "SimdUnitStrideMaskStore",         # vsm.v
-        "SimdStridedLoad",                 # vlse<eew>.v
-        "SimdStridedStore",                # vsse<eew>.v
-        "SimdIndexedLoad",                 # vluxei/vloxei
-        "SimdIndexedStore",                # vsuxei/vsoxei
-        "SimdUnitStrideFaultOnlyFirstLoad",# vle<eew>ff.v
-        "SimdWholeRegisterLoad",           # vl<n>r.v
-        "SimdWholeRegisterStore",          # vs<n>r.v
     ]),
     opLat=1,
     issueLat=1,
     timings=[MinorFUTiming(
-        description="CoralNPU_LSU",
+        description="CoralNPU_ScalarLSU",
         srcRegsRelativeLats=[0],
-        extraAssumedLat=2,
+        extraAssumedLat=1,    # 1+1 = 2 cy total  (RTL: 2 cy)
+    )],
+)
+
+# Vector LSU — 5-cycle DTCM latency (3 overhead + 2 for one 32-byte tx).
+# extraAssumedLat=4 applies to all patterns; multi-sub-transaction accesses
+# (LMUL>1, vl > VLEN/EEW, strided, indexed) naturally stall longer because
+# gem5's LSQ issues one sub-transaction per cycle, adding the correct extra
+# cycles implicitly.
+_CoralNPU_VecLSU = MinorFU(
+    opClasses=_make_op_class_set([
+        "SimdUnitStrideLoad",               # vle<eew>.v
+        "SimdUnitStrideStore",              # vse<eew>.v
+        "SimdUnitStrideMaskLoad",           # vlm.v
+        "SimdUnitStrideMaskStore",          # vsm.v
+        "SimdStridedLoad",                  # vlse<eew>.v
+        "SimdStridedStore",                 # vsse<eew>.v
+        "SimdIndexedLoad",                  # vluxei/vloxei
+        "SimdIndexedStore",                 # vsuxei/vsoxei
+        "SimdUnitStrideFaultOnlyFirstLoad", # vle<eew>ff.v
+        "SimdWholeRegisterLoad",            # vl<n>r.v
+        "SimdWholeRegisterStore",           # vs<n>r.v
+    ]),
+    opLat=1,
+    issueLat=1,
+    timings=[MinorFUTiming(
+        description="CoralNPU_VecLSU",
+        srcRegsRelativeLats=[0],
+        extraAssumedLat=4,    # 1+4 = 5 cy total  (RTL: 3 overhead + 2 EX)
     )],
 )
 
@@ -292,7 +310,8 @@ CoralNPU_FUPool = MinorFUPool(funcUnits=[
     _CoralNPU_MLU,          # 1 shared scalar multiplier
     _CoralNPU_DVU,          # 1 scalar divider (lane-0-only not enforced)
     _CoralNPU_FPU,          # 1 scalar FPU (slot-0-only not enforced)
-    _CoralNPU_LSU,          # 1 LSU slot — handles scalar AND vector memory
+    _CoralNPU_ScalarLSU,    # scalar memory: 2-cy DTCM latency
+    _CoralNPU_VecLSU,       # vector memory: 5-cy DTCM latency
     _CoralNPU_CSR,          # System / CSR / serialising
     # ── RVV co-processor units ──────────────────────────────────────────────
     _make_CoralNPU_VEC_ALU(),   # RVV ALU instance 0  (NUM_ALU=2 in RTL)

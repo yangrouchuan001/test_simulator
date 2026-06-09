@@ -59,6 +59,7 @@
     - 11.14 [Fatal: xbar unable to find destination for \[0xffffffe0:0x100000000\] (UART device covers < one cache line)](#1114-fatal-xbar-unable-to-find-destination-for-0xffffffe00x100000000-uart-device-covers--one-cache-line)
     - 11.15 [Missing output and stats — simulation exits via SIGTRAP when firmware uses ebreak as exit](#1115-missing-output-and-stats--simulation-exits-via-sigtrap-when-firmware-uses-ebreak-as-exit)
     - 11.16 [printf output missing in MinorCPU timing mode — MMIO identity-map created cacheable, stores absorbed by L1D cache](#1116-printf-output-missing-in-minorcpu-timing-mode--mmio-identity-map-created-cacheable-stores-absorbed-by-l1d-cache)
+    - 11.17 [gem5 cycle count lower than Verilator — vector load latency underestimated (shared scalar LSU timing)](#1117-gem5-cycle-count-lower-than-verilator--vector-load-latency-underestimated-shared-scalar-lsu-timing)
 
 ---
 
@@ -72,7 +73,7 @@
 | `src/dev/coralnpu/UartConsole.py` | **New** | gem5 Python param class for `UartConsole` |
 | `src/dev/coralnpu/SConscript` | **New** | Build registration for the UART device |
 | `configs/coralnpu/__init__.py` | **New** | Python package marker |
-| `configs/coralnpu/coralnpu_cpu.py` | **New** | `CoralNPUMinorCPU` class — scalar + RVV FU pool |
+| `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU into `ScalarLSU` (2 cy) and `VecLSU` (5 cy) to match RTL latencies |
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, and `system.cache_line_size=32` |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | (§11.13) Pass RV32-masked `vaddr` to `GenericPageTableFault`; (§11.16) SE translate path uses `pTable->lookup()` to read `Uncacheable` flag and sets `Request::UNCACHEABLE` so MMIO stores bypass the L1D cache |
@@ -2533,3 +2534,138 @@ store directly to the bus → `UartConsole::write()` → `putchar()`.
 cd /orange/ZSP/home/cn2095/test_simulator
 scons build/RISCV/gem5.opt -j$(nproc)
 ```
+
+---
+
+## §11.17 — gem5 cycle count lower than Verilator — vector load latency underestimated (shared scalar LSU timing)
+
+**Symptom**
+
+After all prior fixes the simulation runs correctly, but the total cycle count
+reported by gem5 (`[coralnpu_se] Ticks simulated: N`) is consistently lower than
+the cycle count measured by the Verilator RTL emulator for the same binary and
+memory layout.
+
+**Root cause analysis**
+
+Both gem5 and the Verilator testbench use zero added memory latency by default
+(`latency="1ps"` in gem5; `axi_delay_ns=0.0` in `core_mini_axi_sim`).  The
+gap therefore comes from pipeline model mismatches.  The dominant cause is the
+**vector load latency**.
+
+The RTL defines two distinct latency formulas (§4, `pipeline_and_instructions.md`):
+
+| Access type | RTL latency | Formula |
+|---|---|---|
+| Scalar DTCM load | **2 cycles** | 1 (addr) + 1 (SRAM) |
+| Vector DTCM load (1 sub-tx, vl=4, EEW=32, VLEN=128) | **5 cycles** | 3 overhead (DE2-FF + ROB-FF + VRF-FF) + ceil(vl×EEW_bytes/32) × (1 + memory_cycles) = 3 + 1×2 |
+
+The original `coralnpu_cpu.py` had a **single shared LSU** for both scalar and
+vector ops:
+
+```python
+_CoralNPU_LSU = MinorFU(
+    opClasses=_make_op_class_set([
+        "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
+        "SimdUnitStrideLoad", ...   # vector ops in same FU
+    ]),
+    opLat=1, issueLat=1,
+    timings=[MinorFUTiming(extraAssumedLat=2)],  # 1+2 = 3 cy for everything
+)
+```
+
+This scored **3 cycles** for both scalar and vector loads.  Compared to RTL:
+
+| | RTL | gem5 (old) | Error |
+|---|---|---|---|
+| Scalar load (DTCM) | 2 cy | 3 cy | **+1 cy** (slower, compensating) |
+| Vector load (1 sub-tx, DTCM) | 5 cy | 3 cy | **−2 cy** (faster, dominant) |
+
+For a convolution inner loop that consists primarily of vector loads followed
+by vector multiply-accumulate, the 2-cycle underestimate per vector load
+accumulates directly into the reported cycle count — gem5 finishes in
+significantly fewer cycles than the RTL.
+
+**Additional contributing factors** (smaller magnitude):
+
+- **Branch misprediction**: gem5 `executeBranchDelay=1` (1 cy flush) vs RTL
+  2 fetch cycles flushed on mispredict.
+- **AXI protocol handshake**: even with `axi_delay_ns=0`, the RTL AXI channel
+  registers add ~3–4 cycles per external-memory transaction; gem5 SimpleMemory
+  at `latency="1ps"` responds in ~0 cycles after an L1D cache miss.
+- **PMTRDT unit** (reduction / permutation): gem5 assigns these to the
+  pipelined `VEC_ALU` (`issueLat=1`); RTL uses a single non-pipelined PMTRDT
+  instance.  Not addressed in this section.
+
+**Fix — `configs/coralnpu/coralnpu_cpu.py`**
+
+Split the single LSU into two independent FU pool slots:
+
+```python
+# Scalar LSU — 2-cycle DTCM latency (1 addr + 1 SRAM).
+_CoralNPU_ScalarLSU = MinorFU(
+    opClasses=_make_op_class_set([
+        "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
+    ]),
+    opLat=1, issueLat=1,
+    timings=[MinorFUTiming(description="CoralNPU_ScalarLSU",
+                            srcRegsRelativeLats=[0],
+                            extraAssumedLat=1)],  # 1+1 = 2 cy  (RTL: 2 cy)
+)
+
+# Vector LSU — 5-cycle DTCM latency (3 overhead + 2 for one 32-byte tx).
+_CoralNPU_VecLSU = MinorFU(
+    opClasses=_make_op_class_set([
+        "SimdUnitStrideLoad", "SimdUnitStrideStore",
+        "SimdUnitStrideMaskLoad", "SimdUnitStrideMaskStore",
+        "SimdStridedLoad", "SimdStridedStore",
+        "SimdIndexedLoad", "SimdIndexedStore",
+        "SimdUnitStrideFaultOnlyFirstLoad",
+        "SimdWholeRegisterLoad", "SimdWholeRegisterStore",
+    ]),
+    opLat=1, issueLat=1,
+    timings=[MinorFUTiming(description="CoralNPU_VecLSU",
+                            srcRegsRelativeLats=[0],
+                            extraAssumedLat=4)],  # 1+4 = 5 cy  (RTL: 3+2 cy)
+)
+```
+
+Both entries are added to `CoralNPU_FUPool`:
+
+```python
+_CoralNPU_ScalarLSU,    # scalar memory: 2-cy DTCM latency
+_CoralNPU_VecLSU,       # vector memory: 5-cy DTCM latency
+```
+
+**Why two FU pool slots work in MinorCPU**
+
+gem5's MinorCPU FU pool dispatches each instruction to the first pool slot
+whose `opClasses` set contains the instruction's op-class.  Scalar memory ops
+(`MemRead`, `MemWrite`) hit `_CoralNPU_ScalarLSU` first; vector memory ops
+(`SimdUnitStrideLoad`, etc.) appear only in `_CoralNPU_VecLSU`.  Both slots
+are independent and can be occupied simultaneously, matching the RTL's shared
+8-entry queue that services both scalar and vector accesses in parallel.
+
+**For multi-sub-transaction loads (LMUL > 1, strided, indexed)**
+
+The RTL formula generalises to:
+```
+total = 3 + ceil(vl × EEW_bytes / 32) × (1 + memory_cycles)
+```
+When `vl × EEW_bytes > 32 bytes`, the instruction splits into multiple uops.
+gem5's LSQ issues one sub-transaction per cycle naturally, so each additional
+uop adds 1 cycle of issue latency.  The `extraAssumedLat=4` applies per uop;
+the total stall therefore grows proportionally with the element count, which
+approximates the RTL formula.
+
+**Files modified:**
+- `configs/coralnpu/coralnpu_cpu.py`  (Python only — no rebuild required)
+
+**Remaining timing gaps (not fixed here)**
+
+| Residual gap | Direction | Fix |
+|---|---|---|
+| Branch misprediction: 1 cy gem5 vs 2 cy RTL | gem5 faster | `executeBranchDelay=2` |
+| AXI protocol overhead (even at `axi_delay_ns=0`) | gem5 faster | Add realistic ext_mem latency |
+| PMTRDT non-pipelined (reduction/permutation) | gem5 faster | Separate non-pipelined VEC_PMTRDT FU |
+| Scalar-vector overlap not modeled | gem5 slower | Not straightforward in MinorCPU |
