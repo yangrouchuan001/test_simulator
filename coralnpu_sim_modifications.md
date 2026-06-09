@@ -2772,8 +2772,12 @@ ticks-per-function, converts to cycles using `ticks_per_cycle = 10^12 / freq_hz`
 (gem5 tick resolution is 1 ps), and returns a list sorted by total cycles
 descending.
 
-After `m5.simulate()` returns, `main()` calls this helper and prints a
-formatted table of the top 40 functions:
+After `m5.simulate()` returns, `main()` appends to `stats.txt` in all cases:
+- **Data found** → full function table
+- **ftrace file missing** → a comment line explaining the rebuild requirement
+- **ftrace file empty / no symbols** → a comment line with the `nm` command to diagnose
+
+A formatted table is appended to `stats.txt`:
 
 ```
 [coralnpu_se] ── Function Profile (N functions) ──
