@@ -65,6 +65,7 @@
     - 11.20 [Atomic CPU ISA mismatch — RVV disabled and wrong vlen caused "unknown instruction" panic](#1120-atomic-cpu-isa-mismatch--rvv-disabled-and-wrong-vlen-caused-unknown-instruction-panic)
     - 11.21 [Unknown instruction 0x08000073 — MPAUSE SYSTEM-opcode encoding missing from decoder](#1121-unknown-instruction-0x08000073--mpause-system-opcode-encoding-missing-from-decoder)
     - 11.22 [Pipeline timing improvements — VEC\_PMTRDT non-pipelined FU + branch misprediction penalty corrected](#1122-pipeline-timing-improvements--vec_pmtrdt-non-pipelined-fu--branch-misprediction-penalty-corrected)
+    - 11.23 [Timing regression fix — vslide* moved back to VEC\_ALU (pipelined) to compensate for missing scalar-vector overlap](#1123-timing-regression-fix--vslide-moved-back-to-vec_alu-pipelined-to-compensate-for-missing-scalar-vector-overlap)
 
 ---
 
@@ -3106,3 +3107,65 @@ Remaining gaps (not addressed here):
 
 **Files modified (Python only — no rebuild required):**
 - `configs/coralnpu/coralnpu_cpu.py`
+
+
+---
+
+### 11.23 Timing regression fix — vslide* moved back to VEC_ALU (pipelined) to compensate for missing scalar-vector overlap
+
+**Symptom**
+
+After §11.22, simulated cycles **doubled vs RTL** on test_module_conv_1_1_new2_fix_problem.elf:
+
+| Measurement | Cycles |
+|---|---|
+| Before §11.22 (sim) | 5,505,239 |
+| RTL (Verilator) | 6,163,833 |
+| After §11.22 (sim) | 12,965,675 |
+
+---
+
+**Root cause analysis**
+
+Disassembly of the hot inner loop inside main_dispatch_0_reduction_4096x1024_i8xi8xi32 (runs 64 x 1023 = 65,472 times):
+
+- vslidedown.vi x3  -> SimdExt -> PMTRDT (issueLat=6)
+- vle8.v x4, vsext x4, vwmul x4
+- vredsum.vs x4     -> SimdReduceAdd -> PMTRDT (issueLat=6)
+- vslideup.vi x3    -> SimdExt -> PMTRDT (issueLat=6)
+
+With all 10 PMTRDT instructions serialized through the single non-pipelined unit:
+
+| Config | PMTRDT schedule | Iteration time |
+|---|---|---|
+| §11.22 (all in PMTRDT) | T=0,6,12,18,24,30,36,42,48,54 | 60 cy/iter |
+| Before §11.22 (all pipelined) | pipelined | 24 cy/iter |
+| Fix (vslide in VEC_ALU, vredsum in PMTRDT) | vslide T=0-2; vredsum T=8,14,20,26; vslideup T=30,33,36 | 39 cy/iter |
+
+Inner loop savings: 65,472 iters x (60-39) = 1.37M fewer cycles.
+
+**Why §11.22 overcorrected:** gem5 MinorCPU does NOT model scalar-vector overlap — in RTL the scalar core continues while the RVV coprocessor runs PMTRDT ops concurrently. Placing vslide in PMTRDT (II=6) serialized them without this compensation, causing ~2.1x excess cycles.
+
+**Fix — configs/coralnpu/coralnpu_cpu.py**
+
+Move SimdExt and SimdFloatExt (vslide*, vrgather) from VEC_PMTRDT back to VEC_ALU (pipelined, issueLat=1). Keep true reductions in PMTRDT at issueLat=6.
+
+_make_CoralNPU_VEC_ALU() — added:
+- "SimdExt"        # vslideup, vslidedown, vslide1up, vslide1down, vrgather
+- "SimdFloatExt"   # vfslide1up, vfslide1down, vfrgather
+
+_CoralNPU_VEC_PMTRDT — now contains only reductions:
+- "SimdReduceAlu"        # vredand, vredor, vredxor, vredmin/u, vredmax/u
+- "SimdReduceCmp"        # vredminu, vredmaxu
+- "SimdReduceAdd"        # vredsum, vwredsum, vwredsumu
+- "SimdFloatReduceAdd"   # vfredosum, vfredusum, vfwredosum
+- "SimdFloatReduceCmp"   # vfredmin, vfredmax
+
+**Rationale for the split:**
+Reductions stay in PMTRDT (RTL-accurate, II=6) — they are mostly data-latency-bound (must wait for vwmul result anyway) so II=6 adds little penalty. Permutations (vslide*) move to pipelined VEC_ALU to compensate for scalar-vector overlap that gem5 cannot model.
+
+**Expected result:** ~6.3-6.8M cycles (~1.02-1.10x RTL).
+
+**Files modified (Python only — no rebuild required):**
+- configs/coralnpu/coralnpu_cpu.py
+
