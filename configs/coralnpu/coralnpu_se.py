@@ -33,7 +33,8 @@
 # -----------------
 #   m5out/stats.txt          — cycle count, IPC, cache miss rates, FU occupancy
 #   m5out/config.ini         — full configuration snapshot
-#   m5out/ftrace.system.cpu  — per-function trace (only when --profile is set)
+#   m5out/ftrace.system.cpu  — raw per-function trace (only when --profile is set)
+#   m5out/stats.txt          — function profile table appended after gem5 stats (--profile only)
 
 import argparse
 import os
@@ -101,7 +102,7 @@ def parse_args():
     p.add_argument("--profile", action="store_true",
                    help="Enable per-function cycle profiling. gem5 writes "
                         "m5out/ftrace.system.cpu on each function-boundary "
-                        "crossing; a sorted summary is printed at exit.")
+                        "crossing; a sorted summary is appended to stats.txt.")
     # gem5 passes --outdir itself; we leave it to gem5's option parser.
     return p.parse_args()
 
@@ -408,27 +409,29 @@ def main():
             _hz = _val * {"GHZ": 1e9, "MHZ": 1e6, "KHZ": 1e3, "HZ": 1.0}[_unit]
         else:
             _hz = 1e9  # fallback: assume 1 GHz
-        _ticks_per_cycle = int(round(1e12 / _hz))  # gem5 tick = 1 ps
 
         _outdir = m5.options.outdir if hasattr(m5, "options") else "m5out"
         _ftrace = os.path.join(_outdir, "ftrace.system.cpu")
+        _stats  = os.path.join(_outdir, "stats.txt")
         _rows = _parse_ftrace(_ftrace, int(_hz))
 
         if _rows:
             _total_cy = sum(r[1] for r in _rows)
-            print(f"[coralnpu_se] ── Function Profile ({'%d' % len(_rows)} functions) ──")
-            print(f"  {'Function':<40} {'Cycles':>10} {'%':>6} {'Calls':>8}")
-            print(f"  {'-'*40} {'-'*10} {'-'*6} {'-'*8}")
-            for _fn, _cy, _cnt in _rows[:40]:  # top 40
+            _lines = []
+            _lines.append(f"\n---------- Function Profile "
+                          f"({len(_rows)} functions) ----------\n")
+            _lines.append(f"  {'Function':<40} {'Cycles':>12} {'%':>6} {'Calls':>8}\n")
+            _lines.append(f"  {'-'*40} {'-'*12} {'-'*6} {'-'*8}\n")
+            for _fn, _cy, _cnt in _rows:
                 _pct = 100.0 * _cy / _total_cy if _total_cy else 0
-                print(f"  {_fn:<40} {_cy:>10,} {_pct:>5.1f}% {_cnt:>8,}")
-            if len(_rows) > 40:
-                _rest_cy = sum(r[1] for r in _rows[40:])
-                _rest_pct = 100.0 * _rest_cy / _total_cy if _total_cy else 0
-                print(f"  {'... (%d more)' % (len(_rows)-40):<40} "
-                      f"{_rest_cy:>10,} {_rest_pct:>5.1f}%")
-            print(f"  {'TOTAL':<40} {_total_cy:>10,} {'100.0%':>6}")
-            print()
+                _lines.append(f"  {_fn:<40} {_cy:>12,} {_pct:>5.1f}% {_cnt:>8,}\n")
+            _lines.append(f"  {'-'*40} {'-'*12} {'-'*6} {'-'*8}\n")
+            _lines.append(f"  {'TOTAL':<40} {_total_cy:>12,} {'100.0%':>6}\n")
+            _lines.append(f"\n---------- End Function Profile ----------\n")
+            with open(_stats, "a") as _f:
+                _f.writelines(_lines)
+            print(f"[coralnpu_se] Function profile ({len(_rows)} functions) "
+                  f"appended to {_stats}\n")
         else:
             print(f"[coralnpu_se] Profile: no data in {_ftrace} "
                   f"(check ELF has symbols and --profile was set)\n")

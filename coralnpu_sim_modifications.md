@@ -2794,7 +2794,7 @@ formatted table of the top 40 functions:
 
 Output:
 - `m5out/ftrace.system.cpu` — raw trace (one line per function boundary crossing)
-- Terminal — sorted per-function cycle table (top 40 by cycle count)
+- `m5out/stats.txt` — function profile table appended after the standard gem5 stats block
 
 **Notes:**
 - The ELF binary must retain symbols (compiled without `-s` / `--strip-all`).
