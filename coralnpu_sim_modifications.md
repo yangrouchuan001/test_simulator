@@ -81,6 +81,7 @@
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
+| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did) |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -2682,6 +2683,43 @@ during simulation.  Knowing per-function cycle counts is necessary to identify
 hot spots that warrant microarchitectural optimisation and to correlate gem5
 timing with RTL profiles.
 
+**Root cause of "no data" when using MinorCPU**
+
+`BaseCPU::traceFunctions(Addr pc)` is the hook that records function-boundary
+crossings. In gem5, it is called at instruction commit — but only in two CPU
+models:
+
+| CPU | Call site |
+|-----|-----------|
+| O3CPU | `src/cpu/o3/commit.cc:1033` |
+| SimpleCPU (Atomic/Timing) | `src/cpu/simple/base.cc:511` |
+| **MinorCPU** | **never — omitted from the codebase** |
+
+Because MinorCPU never called `traceFunctions`, the ftrace file was never
+written (the file is created by the constructor but nothing writes to it).
+
+**Fix — `src/cpu/minor/execute.cc`**
+
+One line added at the end of `Execute::doInstCommitAccounting`, immediately
+after the existing `probeInstCommit` call (line 951):
+
+```cpp
+    cpu.probeInstCommit(inst->staticInst, inst->pc->instAddr());
++   cpu.traceFunctions(inst->pc->instAddr());
+```
+
+`traceFunctions` is defined inline in `base.hh` — it checks
+`functionTracingEnabled` before calling `traceFunctionsInternal`, so there is
+zero overhead when `--profile` is not set.
+
+**Rebuild required** (C++ change):
+```bash
+cd /orange/ZSP/home/cn2095/test_simulator
+scons build/RISCV/gem5.opt -j$(nproc)
+```
+
+---
+
 **gem5 built-in mechanism**
 
 `BaseCPU` already includes a built-in function tracer:
@@ -2770,4 +2808,5 @@ Output:
   `system.cpu` in the gem5 object hierarchy.
 
 **Files modified:**
-- `configs/coralnpu/coralnpu_se.py`  (Python only — no rebuild required)
+- `src/cpu/minor/execute.cc`  — add `cpu.traceFunctions(inst->pc->instAddr())` in `doInstCommitAccounting` (**rebuild required**)
+- `configs/coralnpu/coralnpu_se.py`  — `--profile` flag, `cpu.function_trace = True`, `_parse_ftrace()` summary (Python only — no rebuild required)
