@@ -6082,6 +6082,13 @@ decode QUADRANT default Unknown::unknown() {
         0x1c: decode FUNCT3 {
             format SystemOp {
                 0x0: decode FUNCT7 {
+                    // funct7=0x4, rs2=0x0 → funct12=0x080 = CoralNPU MPAUSE
+                    // (SYSTEM-opcode encoding; same semantics as custom-0 mpause)
+                    0x4: decode RS2 {
+                        0x0: mpause_sys({{
+                            return executeMpause(xc);
+                        }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
+                    }
                     0x0: decode RS2 {
                         0x0: ecall({{
                             MISA misa = xc->readMiscReg(MISCREG_ISA);

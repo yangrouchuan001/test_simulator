@@ -62,6 +62,8 @@
     - 11.17 [gem5 cycle count lower than Verilator — vector load latency underestimated (shared scalar LSU timing)](#1117-gem5-cycle-count-lower-than-verilator--vector-load-latency-underestimated-shared-scalar-lsu-timing)
     - 11.18 [Function-level cycle profiling — `--profile` flag added to coralnpu_se.py](#1118-function-level-cycle-profiling--profile-flag-added-to-coralnpu_sepy)
     - 11.19 [mpause exits simulation cleanly — `executeMpause` added to SystemOp](#1119-mpause-exits-simulation-cleanly--executempause-added-to-systemop)
+    - 11.20 [Atomic CPU ISA mismatch — RVV disabled and wrong vlen caused "unknown instruction" panic](#1120-atomic-cpu-isa-mismatch--rvv-disabled-and-wrong-vlen-caused-unknown-instruction-panic)
+    - 11.21 [Unknown instruction 0x08000073 — MPAUSE SYSTEM-opcode encoding missing from decoder](#1121-unknown-instruction-0x08000073--mpause-system-opcode-encoding-missing-from-decoder)
 
 ---
 
@@ -69,7 +71,7 @@
 
 | File | Type | Purpose |
 |------|------|---------|
-| `src/arch/riscv/isa/decoder.isa` | **Modified** | Decode `mpause` via existing `SystemOp` format (custom-0, `0x0000000B`); (§11.19) call `executeMpause` to exit simulation cleanly |
+| `src/arch/riscv/isa/decoder.isa` | **Modified** | Decode `mpause` via existing `SystemOp` format (custom-0, `0x0000000B`); (§11.19) call `executeMpause` to exit simulation cleanly; (§11.21) add `mpause_sys` for SYSTEM-opcode encoding `0x08000073` (`RVTEST_PASS` macro) |
 | `src/arch/riscv/insts/standard.hh` | **Modified** | (§11.19) Declare `SystemOp::executeMpause` |
 | `src/arch/riscv/insts/standard.cc` | **Modified** | (§11.19) Implement `executeMpause`: calls `exitSimLoop("mpause @ PC", 0)` |
 | `src/dev/coralnpu/uart_console.hh` | **New** | `UartConsole` SimObject header |
@@ -78,7 +80,7 @@
 | `src/dev/coralnpu/SConscript` | **New** | Build registration for the UART device |
 | `configs/coralnpu/__init__.py` | **New** | Python package marker |
 | `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU into `ScalarLSU` (2 cy) and `VecLSU` (5 cy) to match RTL latencies |
-| `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, atomic-CPU `privilege_mode_set="M"`, `system.cache_line_size=32`, and `--profile` for per-function cycle profiling |
+| `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, `system.cache_line_size=32`, `--profile`; (§11.20) atomic CPU ISA aligned with MinorCPU (`enable_rvv=True, vlen=128, elen=32`) |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | (§11.13) Pass RV32-masked `vaddr` to `GenericPageTableFault`; (§11.16) SE translate path uses `pTable->lookup()` to read `Uncacheable` flag and sets `Request::UNCACHEABLE` so MMIO stores bypass the L1D cache |
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
@@ -2891,4 +2893,124 @@ SystemOp::executeMpause(ExecContext *xc) const
 **Files modified (rebuild required):**
 - `src/arch/riscv/insts/standard.hh`
 - `src/arch/riscv/insts/standard.cc`
+- `src/arch/riscv/isa/decoder.isa`
+
+---
+
+### 11.20 Atomic CPU ISA mismatch — RVV disabled and wrong `vlen` caused "unknown instruction" panic
+
+**Error**
+
+```
+src/arch/riscv/faults.cc:292: panic: Unknown instruction 0x100008d008000073
+```
+
+Occurred when running `--cpu atomic` with an ISA coverage test binary.
+
+**Root cause**
+
+The atomic CPU was configured with a different ISA than `CoralNPUMinorCPU`:
+
+| Parameter | Atomic (before) | MinorCPU |
+|-----------|-----------------|----------|
+| `riscv_type` | `"RV32"` | `"RV32"` |
+| `enable_rvv` | `False` ← | `True` |
+| `vlen` | *(default, 512)* ← | `128` |
+| `elen` | *(default, 64)* ← | `32` |
+| `privilege_mode_set` | `"M"` | `"M"` |
+
+With `enable_rvv=False`, the decoder does not register any RVV instruction
+patterns. When the firmware executes a vector instruction (e.g. `vsetvli`,
+`vle32.v`), the decoder returns `UnknownInstFault`, which calls `panic`.
+
+The wrong `vlen` means `vsetvli` would compute a different `vl` than the
+firmware expects, causing incorrect results even when not panicking.
+
+**Fix — `configs/coralnpu/coralnpu_se.py`**
+
+```python
+# Before
+cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False,
+                     privilege_mode_set="M")]
+
+# After
+cpu.isa = [RiscvISA(
+    riscv_type        = "RV32",
+    enable_rvv        = True,
+    vlen              = 128,   # CoralNPU: 128-bit vector registers
+    elen              = 32,    # CoralNPU: max element width 32 bits
+    privilege_mode_set = "M",
+)]
+```
+
+`CoralNPUMinorCPU` already defines the correct ISA at class level in
+`coralnpu_cpu.py`; only the atomic CPU branch needed updating.
+
+**Files modified:**
+- `configs/coralnpu/coralnpu_se.py`  (Python only — no rebuild required)
+
+---
+
+### 11.21 Unknown instruction `0x08000073` — MPAUSE SYSTEM-opcode encoding missing from decoder
+
+**Error**
+
+```
+src/arch/riscv/faults.cc:292: panic: Unknown instruction 0x1000010008000073
+```
+
+Occurred on both `--cpu atomic` and `--cpu minor` when running the ISA coverage
+test binary (`coralnpu_v2_isa_coverage_test.elf`).
+
+**Root cause**
+
+CoralNPU has **two encodings** of the MPAUSE instruction:
+
+| Encoding | Hex | Opcode space | Use |
+|----------|-----|--------------|-----|
+| Custom-0 | `0x0000000B` | custom-0 (`0x0b`) | Firmware, RTL co-sim |
+| SYSTEM   | `0x08000073` | SYSTEM (`0x73`) | Test harness (`RVTEST_PASS` macro), `coralnpu_start.S` |
+
+The SYSTEM encoding was confirmed from:
+- `coralnpu/third_party/riscv-tests/env/p/riscv_test.h:37` — `#define RVTEST_PASS .word 0x08000073`
+- `coralnpu/toolchain/crt/coralnpu_start.S:144` — `.word 0x08000073 # mpause`
+- `coralnpu/hdl/chisel/src/coralnpu/scalar/Decode.scala:917` — `BitPat("b000010000000_00000_000_00000_11100_11")`
+
+The simulator already decoded the custom-0 form (§11.19), but not the SYSTEM form.
+
+**Encoding analysis**
+
+`0x08000073` decomposes as:
+- opcode\[6:0\] = `1110011` → SYSTEM (0x73)
+- funct3\[14:12\] = `000` → PRIV class
+- funct7\[31:25\] = `0000100` → **0x04**
+- rs2\[24:20\]   = `00000` → **0x00**
+- funct12\[31:20\] = `000010000000` → **0x080**
+
+The PRIV FUNCT7 decode already had `0x0` (ecall/ebreak), `0x8` (sret),
+`0x18` (mret), `0x14` (sfence), etc.  `0x4` was not handled → `UnknownInstFault`.
+
+**Fix — `src/arch/riscv/isa/decoder.isa`**
+
+Added one new decode arm inside `0x1c: decode FUNCT3 { 0x0: decode FUNCT7 {`:
+
+```diff
+                 0x0: decode FUNCT7 {
++                    // funct7=0x4, rs2=0x0 → funct12=0x080 = CoralNPU MPAUSE
++                    0x4: decode RS2 {
++                        0x0: mpause_sys({{
++                            return executeMpause(xc);
++                        }}, IsNonSpeculative, IsSerializeAfter, No_OpClass);
++                    }
+                     0x0: decode RS2 {
+                         0x0: ecall({{ ... }});
+                         0x1: ebreak({{ ... }});
+                     }
+```
+
+The class name `mpause_sys` is used (not `mpause`) to avoid a duplicate class
+name with the existing custom-0 `Mpause` class.  Both call `executeMpause`,
+so both encodings exit the simulation with `"mpause @ 0xPC"`.
+
+**Files modified (rebuild required):**
 - `src/arch/riscv/isa/decoder.isa`

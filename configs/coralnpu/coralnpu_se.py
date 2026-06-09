@@ -173,11 +173,18 @@ def build_system(args):
     if args.cpu == "atomic":
         system.mem_mode = "atomic"
         cpu = RiscvAtomicSimpleCPU()
-        cpu.isa = [RiscvISA(riscv_type="RV32", enable_rvv=False,
-                             privilege_mode_set="M")]
+        # Match CoralNPUMinorCPU ISA exactly so the same ELF runs on both
+        # without "unknown instruction" panics (RVV, vlen, elen, privilege).
+        cpu.isa = [RiscvISA(
+            riscv_type        = "RV32",
+            enable_rvv        = True,
+            vlen              = 128,   # CoralNPU: 128-bit vector registers
+            elen              = 32,    # CoralNPU: max element width 32 bits
+            privilege_mode_set = "M", # bare-metal M-mode only
+        )]
     else:
         system.mem_mode = "timing"
-        cpu = CoralNPUMinorCPU()
+        cpu = CoralNPUMinorCPU()  # ISA already set in CoralNPUMinorCPU class
 
     if args.max_insts > 0:
         cpu.max_insts_any_thread = args.max_insts
