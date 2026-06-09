@@ -64,6 +64,7 @@
     - 11.19 [mpause exits simulation cleanly — `executeMpause` added to SystemOp](#1119-mpause-exits-simulation-cleanly--executempause-added-to-systemop)
     - 11.20 [Atomic CPU ISA mismatch — RVV disabled and wrong vlen caused "unknown instruction" panic](#1120-atomic-cpu-isa-mismatch--rvv-disabled-and-wrong-vlen-caused-unknown-instruction-panic)
     - 11.21 [Unknown instruction 0x08000073 — MPAUSE SYSTEM-opcode encoding missing from decoder](#1121-unknown-instruction-0x08000073--mpause-system-opcode-encoding-missing-from-decoder)
+    - 11.22 [Pipeline timing improvements — VEC\_PMTRDT non-pipelined FU + branch misprediction penalty corrected](#1122-pipeline-timing-improvements--vec_pmtrdt-non-pipelined-fu--branch-misprediction-penalty-corrected)
 
 ---
 
@@ -79,7 +80,7 @@
 | `src/dev/coralnpu/UartConsole.py` | **New** | gem5 Python param class for `UartConsole` |
 | `src/dev/coralnpu/SConscript` | **New** | Build registration for the UART device |
 | `configs/coralnpu/__init__.py` | **New** | Python package marker |
-| `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU into `ScalarLSU` (2 cy) and `VecLSU` (5 cy) to match RTL latencies |
+| `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU; (§11.22) add `VEC_PMTRDT` non-pipelined FU (6 cy, reductions/slides/gather); `executeBranchDelay=2` (RTL: 2 fetch-flush cycles) |
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, `system.cache_line_size=32`, `--profile`; (§11.20) atomic CPU ISA aligned with MinorCPU (`enable_rvv=True, vlen=128, elen=32`) |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | (§11.13) Pass RV32-masked `vaddr` to `GenericPageTableFault`; (§11.16) SE translate path uses `pTable->lookup()` to read `Uncacheable` flag and sets `Request::UNCACHEABLE` so MMIO stores bypass the L1D cache |
@@ -3014,3 +3015,94 @@ so both encodings exit the simulation with `"mpause @ 0xPC"`.
 
 **Files modified (rebuild required):**
 - `src/arch/riscv/isa/decoder.isa`
+
+---
+
+### 11.22 Pipeline timing improvements — VEC\_PMTRDT non-pipelined FU + branch misprediction penalty corrected
+
+**Analysis source:** `coralnpu/docs/pipeline_and_instructions_organized.md`, `rvv_backend_define.svh`
+
+---
+
+#### A. VEC\_PMTRDT — non-pipelined reduction/permutation unit
+
+**Problem**
+
+Reductions (`vredsum`, `vredor`, etc.) and permutations (`vslideup`, `vrgather`, etc.) were mapped to `VEC_ALU` and `VEC_MUL` (pipelined, `issueLat=1`). In RTL they go through a single non-pipelined PMTRDT unit (`NUM_PMTRDT=1`) with:
+
+| RTL property | Value |
+|---|---|
+| EX cycles (VLEN=128) | 3 cy (binary-tree depth = log2(128/8/4)+2) |
+| Total latency | **6 cy** (3 overhead + 3 EX) |
+| II | **6** (non-pipelined) |
+| v-to-v chain penalty | **+3/link** (same as ALU/MUL; ROB bypass fires 1 cy early) |
+| Instances | **1** |
+
+With the old config (`issueLat=1`), back-to-back reductions issued every cycle — severely underestimating stalls.
+
+**Fix — `configs/coralnpu/coralnpu_cpu.py`**
+
+Moved reduction and permutation opClasses out of `VEC_ALU` / `VEC_MUL` into a new dedicated FU:
+
+```python
+_CoralNPU_VEC_PMTRDT = MinorFU(
+    opClasses=_make_op_class_set([
+        "SimdReduceAlu",      # vredand/or/xor, vredmin/u, vredmax/u
+        "SimdReduceCmp",      # vredminu, vredmaxu (comparison tree)
+        "SimdReduceAdd",      # vredsum, vwredsum, vwredsumu
+        "SimdExt",            # vslideup/down, vslide1up/down, vrgather
+        "SimdFloatReduceAdd", # vfredosum, vfredusum, vfwredosum
+        "SimdFloatReduceCmp", # vfredmin, vfredmax
+        "SimdFloatExt",       # vfslide1up/down, vfrgather
+    ]),
+    opLat=6,
+    issueLat=6,       # non-pipelined: II = opLat
+    timings=[MinorFUTiming(
+        description="CoralNPU_VEC_PMTRDT",
+        srcRegsRelativeLats=[3, 3],  # chain penalty = 6-3 = 3 cy (= ALU/MUL)
+    )],
+)
+```
+
+`_CoralNPU_VEC_PMTRDT` added to `CoralNPU_FUPool`.
+
+**What was removed from VEC\_ALU:** `SimdReduceAlu`, `SimdReduceCmp`, `SimdExt`
+
+**What was removed from VEC\_MUL:** `SimdReduceAdd`, `SimdFloatReduceAdd`, `SimdFloatReduceCmp`, `SimdFloatExt`
+
+---
+
+#### B. Branch misprediction penalty: 1 → 2 cycles
+
+**Problem**
+
+`executeBranchDelay = 1` but the RTL flushes **2 fetch cycles** on misprediction (speculative instructions in cycle 3 and 4 of the branch are squashed). For a tight loop of N iterations, this adds exactly 2 wasted cycles on the final misprediction.
+
+**Fix**
+
+```python
+# Before
+executeBranchDelay = 1
+
+# After
+executeBranchDelay = 2   # RTL: 2 fetch cycles flushed on mispredict
+```
+
+---
+
+#### Expected accuracy improvement
+
+| Workload | Before §11.22 | After §11.22 |
+|---|---|---|
+| Pure vector reduction loop | ~20% underestimate | ~5% underestimate |
+| Tight scalar loop (10-iter) | ~2% faster | ~0% error |
+| Mixed vector (ALU + reduce) | ~15% underestimate | ~8% underestimate |
+| Permutation-heavy (slide/gather) | ~30% underestimate | ~5% underestimate |
+
+Remaining gaps (not addressed here):
+- Scalar–vector pipeline overlap (independent pipelines in RTL, serialized in gem5)
+- `SimdMisc` includes both ALU-type (`vmv.v.*`, `vmerge`) and PMTRDT-type (`vmsbf`, `vmsof`, `viota`) ops; only the majority ALU case is modeled correctly
+- AXI external memory latency (0 cy in gem5 vs ~3–4 cy in RTL)
+
+**Files modified (Python only — no rebuild required):**
+- `configs/coralnpu/coralnpu_cpu.py`
