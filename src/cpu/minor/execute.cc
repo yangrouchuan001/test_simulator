@@ -552,6 +552,12 @@ Execute::issue(ThreadID thread_id)
     if (!insts_in)
         return 0;
 
+    /* §11.34: Track FUs still needed by un-dispatched pending queue items.
+     * Populated after the dispatch loop below; used by the normal issue loop
+     * to avoid stealing a FU that an older inFlightInsts entry is waiting for,
+     * which would cause an inFlightInsts ordering deadlock. */
+    std::vector<bool> fuReservedByPending(numFuncUnits, false);
+
     /* OOO vector dispatch: try to dispatch deferred vector instructions from
      * the pending queue to free FUs. This models RTL RS-based OOO vector
      * execution where each FU dispatches independently when deps are ready. */
@@ -645,6 +651,23 @@ Execute::issue(ThreadID thread_id)
 
             if (!dispatched)
                 ++it;
+        }
+
+        /* §11.34: Mark FUs reserved by items that remain in the pending queue
+         * (items that were NOT dispatched this cycle). The normal issue loop
+         * must not use these FUs, or a newer instruction could execute before
+         * the older pending item, creating an inFlightInsts ordering deadlock
+         * when the newer instruction tries to commit but the older one (which
+         * never dispatched) is still at HEAD with pendingFUDispatch=true. */
+        for (const auto &pq_inst : thread.vectorPendingQueue) {
+            if (!pq_inst->pendingFUDispatch ||
+                pq_inst->id.streamSeqNum != thread.streamSeqNum)
+                continue;
+            for (unsigned fi = 0; fi < numFuncUnits; fi++) {
+                if (funcUnits[fi]->provides(pq_inst->staticInst->opClass())) {
+                    fuReservedByPending[fi] = true;
+                }
+            }
         }
     }
 
@@ -751,6 +774,17 @@ Execute::issue(ThreadID thread_id)
                     DPRINTF(MinorExecute, "Can't issue inst: %s to busy FU"
                         " for another: %d cycles\n",
                         *inst, fu->cyclesBeforeInsert());
+                } else if (!inst->isFault() &&
+                           inst->staticInst->isVector() &&
+                           fuReservedByPending[fu_index]) {
+                    /* §11.34: FU is available but an older pending queue item
+                     * needs it; block this newer instruction from stealing it.
+                     * The deferral check below will push it to vectorPendingQueue
+                     * so it queues up BEHIND the older item and preserves
+                     * inFlightInsts commit order. */
+                    DPRINTF(MinorExecute,
+                        "Can't issue as FU: %d is reserved by older pending"
+                        " vector inst\n", fu_index);
                 } else {
                     MinorFUTiming *timing = (!inst->isFault() ?
                         fu->findTiming(inst->staticInst) : NULL);
@@ -905,7 +939,11 @@ Execute::issue(ThreadID thread_id)
                     FUPipeline *f = funcUnits[fi];
                     if (!f->provides(inst->staticInst->opClass())) continue;
                     any_capable_fu_exists = true;
-                    if (!f->alreadyPushed() && !f->stalled && f->canInsert()) {
+                    /* §11.34: A FU reserved by an older pending item is not
+                     * considered "free" — treat it like a busy FU so this
+                     * instruction gets deferred to vectorPendingQueue. */
+                    if (!f->alreadyPushed() && !f->stalled && f->canInsert() &&
+                        !fuReservedByPending[fi]) {
                         any_capable_fu_free = true;
                         break;
                     }

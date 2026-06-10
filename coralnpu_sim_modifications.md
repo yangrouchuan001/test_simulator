@@ -69,6 +69,7 @@
     - 11.24–11.31 [OOO vector dispatch, bypass commit, hazard fixes (vectorPendingQueue)](#1124-1131-ooo-vector-dispatch-bypass-commit-hazard-fixes)
     - 11.32 [CPI=222 — branch bypass-commit causes repeated stream changes (~98% misprediction rate)](#1132-cpi222--branch-bypass-commit-causes-repeated-stream-changes)
     - 11.33 [Permanent deadlock — vectorPendingQueue dispatches out-of-order microop, violating inFlightInsts ordering](#1133-permanent-deadlock--vectorpendingqueue-dispatches-out-of-order-microop)
+    - 11.34 [Permanent deadlock — normal issue loop steals FU from older pending item that failed scoreboard check](#1134-permanent-deadlock--normal-issue-loop-steals-fu-from-older-pending-item-that-failed-scoreboard-check)
 
 ---
 
@@ -91,7 +92,7 @@
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
-| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops; (§11.33) add `fuScoreboardBlocked` in pendingQueue dispatch loop to prevent out-of-order microop dispatch |
+| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops; (§11.33) add `fuScoreboardBlocked` in pendingQueue dispatch loop to prevent out-of-order microop dispatch; (§11.34) add `fuReservedByPending` to prevent normal issue loop from stealing a FU that an older pending item is waiting for |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -3962,3 +3963,114 @@ itself is the first instruction to write `vd` after `vpinvd_v_micro`. The
 
 - `src/cpu/minor/execute.cc`: add `fuScoreboardBlocked` vector and per-FU
   scoreboard-blocked check in the `vectorPendingQueue` dispatch loop (§11.25 path)
+
+---
+
+## 11.34 Permanent deadlock — normal issue loop steals FU from older pending item that failed scoreboard check
+
+### Symptom
+
+Simulation enters a permanent stall. The stuck instruction at the front of the
+input buffer keeps failing to issue because FU 14 reports `it's stalled`. This
+repeats every cycle until the simulation timeout. The last committed instruction
+was `vsetivli` (inst `239516`) at cycle 276179000; nothing commits afterward.
+
+### Root cause chain
+
+```
+Cycle 276169000: vsext_vf2 macro 239517 decomposes into 2 microops:
+  239517.240213  (vsext_vf2_micro, FU 14)
+  239517.240214  (vsext_vf2_micro, FU 14)
+Both deferred to vectorPendingQueue — FU 14 is busy.
+
+Cycle 276179000: FU 14 becomes free (vslidedown_vi_micro 239515 commits,
+  unstalling FU 14).
+
+vectorPendingQueue dispatch loop (runs first):
+  Try 239517.240213 for FU 14:
+    canInsert()=true, !stalled, !alreadyPushed → proceed
+    canInstIssue fails (source register marked unavailable — scoreboard MAX
+    poisoning from a later-deferred instruction writing the same register)
+    → fuScoreboardBlocked[14] = true
+  239517.240214, 239518.*, etc.: fuScoreboardBlocked[14] → all skipped
+  Result: nothing dispatched, no debug output
+
+Normal issue loop (runs second, no fuScoreboardBlocked guard):
+  Instruction 239527.240237 (vcpyvs_v_micro, FU 14) is at front of input buffer
+    canInsert()=true (same FU state), canInstIssue passes
+    → ISSUED to FU 14!
+
+239527.240237 completes at FU 14 output at cycle 276185000.
+HEAD of inFlightInsts = 239517.240213 (pendingFUDispatch=true, never dispatched)
+→ FU 14 stalls (239527.240237 can't commit past HEAD 239517)
+→ 239517 needs FU 14, but FU 14 is stalled → permanent deadlock
+```
+
+The §11.33 fix (`fuScoreboardBlocked`) correctly prevented *later pending items*
+from bypassing 239517 within the vectorPendingQueue dispatch loop, but the
+**normal issue loop** runs afterward in the same `issue()` call and is entirely
+unaware of `fuScoreboardBlocked`. It issues 239527.240237 to FU 14 freely,
+because the FU state visible to both loops is identical at that moment.
+
+### Fix
+
+Added `fuReservedByPending[]` — a per-FU boolean vector computed after the
+`vectorPendingQueue` dispatch loop by scanning the queue for items that were NOT
+dispatched this cycle. Any FU that a remaining pending item could use is marked
+reserved. The normal issue loop then treats reserved FUs as if they were busy:
+
+**1. Declare before the dispatch block:**
+```cpp
+std::vector<bool> fuReservedByPending(numFuncUnits, false);
+```
+
+**2. Populate inside the dispatch block, after the dispatch loop:**
+```cpp
+for (const auto &pq_inst : thread.vectorPendingQueue) {
+    if (!pq_inst->pendingFUDispatch ||
+        pq_inst->id.streamSeqNum != thread.streamSeqNum)
+        continue;
+    for (unsigned fi = 0; fi < numFuncUnits; fi++) {
+        if (funcUnits[fi]->provides(pq_inst->staticInst->opClass()))
+            fuReservedByPending[fi] = true;
+    }
+}
+```
+
+**3. In the FU-scanning loop of the normal issue, after `!fu->canInsert()` check:**
+```cpp
+} else if (!inst->isFault() &&
+           inst->staticInst->isVector() &&
+           fuReservedByPending[fu_index]) {
+    DPRINTF(MinorExecute,
+        "Can't issue as FU: %d is reserved by older pending vector inst\n",
+        fu_index);
+```
+
+**4. In the deferral "any_capable_fu_free" check, add the reservation guard:**
+```cpp
+if (!f->alreadyPushed() && !f->stalled && f->canInsert() &&
+    !fuReservedByPending[fi]) {
+    any_capable_fu_free = true;
+```
+
+With this fix, at cycle 276179000:
+- Dispatch loop: 239517.240213 fails `canInstIssue` → `fuReservedByPending[14] = true`
+- Normal issue: 239527.240237 hits FU 14 → `fuReservedByPending[14]` → skipped
+- Deferral check: no capable FU is "free" for 239527.240237 → deferred to pending queue
+- Pending queue now: `[239517.240213, 239517.240214, ..., 239527.240237, ...]`
+
+At cycle 276180000, FU 14 is empty (advance() cleared 239515). The dispatch loop
+tries 239517.240213; if `canInstIssue` now passes (scoreboard cleared), 239517
+dispatches to FU 14 first. 239527.240237 dispatches in a later cycle, after
+239517 has committed from HEAD of `inFlightInsts`. Deadlock avoided.
+
+The check applies **only to vector instructions** (`isVector()` guard). Non-vector
+instructions are unaffected; they cannot be deferred to `vectorPendingQueue`
+anyway and in practice use different FU indices.
+
+### Files changed
+
+- `src/cpu/minor/execute.cc`: add `fuReservedByPending` vector; populate it
+  after the `vectorPendingQueue` dispatch loop; add reservation check in the
+  normal issue loop FU-scan and in the vector-deferral `any_capable_fu_free` test
