@@ -1465,22 +1465,29 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                 if (!(fu_inst.inst->id == cand->id))
                                     continue;
                             }
-                            /* WAR hazard check: don't bypass cand if it
-                             * writes any source register of any instruction
-                             * ahead of it in inFlightInsts (positions 0 to
-                             * scan_idx-1). Those instructions commit after
-                             * cand in a bypass but they came earlier in
-                             * program order and must read the pre-write
-                             * value. Committing cand first would leave them
-                             * reading cand's new (post-write) register value
-                             * at execute time → functional incorrectness. */
+                            /* Hazard check: bypass of cand past any earlier
+                             * instruction (positions 0..scan_idx-1) is only
+                             * safe if cand is fully independent of all of
+                             * them.  Three hazard types must be blocked:
+                             *  WAR – cand writes a reg that prev reads
+                             *        (prev must see the pre-write value)
+                             *  RAW – cand reads a reg that prev will write
+                             *        (cand would read a stale pre-write
+                             *        value because prev hasn't committed yet)
+                             *  WAW – cand writes a reg that prev also writes
+                             *        (prev's later commit would overwrite
+                             *        cand's result, losing cand's write) */
                             {
-                                bool war_hazard = false;
+                                bool hazard = false;
                                 if (cand->isInst()) {
                                     auto *isa =
                                         cpu.getContext(thread_id)->getIsaPtr();
+                                    int cand_ns =
+                                        cand->staticInst->numSrcRegs();
+                                    int cand_nd =
+                                        cand->staticInst->numDestRegs();
                                     for (unsigned int chk = 0;
-                                         chk < scan_idx && !war_hazard; chk++)
+                                         chk < scan_idx && !hazard; chk++)
                                     {
                                         QueuedInst *prev =
                                             ex_info.inFlightInsts->peekAt(chk);
@@ -1488,26 +1495,59 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                         MinorDynInstPtr pi = prev->inst;
                                         if (pi->isBubble() || pi->isFault()
                                             || !pi->isInst()) continue;
-                                        int ns = pi->staticInst->numSrcRegs();
-                                        int nd =
-                                            cand->staticInst->numDestRegs();
+                                        int pi_ns =
+                                            pi->staticInst->numSrcRegs();
+                                        int pi_nd =
+                                            pi->staticInst->numDestRegs();
+                                        /* WAR: cand.dest ∩ prev.src */
                                         for (int si = 0;
-                                             si < ns && !war_hazard; si++) {
-                                            RegId src =
+                                             si < pi_ns && !hazard; si++) {
+                                            RegId psrc =
                                                 pi->staticInst->srcRegIdx(si)
                                                 .flatten(*isa);
                                             for (int di = 0;
-                                                 di < nd && !war_hazard; di++) {
-                                                if (src ==
+                                                 di < cand_nd && !hazard; di++) {
+                                                if (psrc ==
                                                     cand->staticInst
                                                     ->destRegIdx(di)
                                                     .flatten(*isa))
-                                                    war_hazard = true;
+                                                    hazard = true;
+                                            }
+                                        }
+                                        /* RAW: cand.src ∩ prev.dest */
+                                        for (int di = 0;
+                                             di < pi_nd && !hazard; di++) {
+                                            RegId pdst =
+                                                pi->staticInst->destRegIdx(di)
+                                                .flatten(*isa);
+                                            for (int si = 0;
+                                                 si < cand_ns && !hazard; si++) {
+                                                if (pdst ==
+                                                    cand->staticInst
+                                                    ->srcRegIdx(si)
+                                                    .flatten(*isa))
+                                                    hazard = true;
+                                            }
+                                        }
+                                        /* WAW: cand.dest ∩ prev.dest */
+                                        for (int di = 0;
+                                             di < pi_nd && !hazard; di++) {
+                                            RegId pdst =
+                                                pi->staticInst->destRegIdx(di)
+                                                .flatten(*isa);
+                                            for (int cdi = 0;
+                                                 cdi < cand_nd && !hazard;
+                                                 cdi++) {
+                                                if (pdst ==
+                                                    cand->staticInst
+                                                    ->destRegIdx(cdi)
+                                                    .flatten(*isa))
+                                                    hazard = true;
                                             }
                                         }
                                     }
                                 }
-                                if (war_hazard) continue;
+                                if (hazard) continue;
                             }
                             DPRINTF(MinorExecute, "Bypass committing"
                                 " scalar inst %s past pending vector"
@@ -1562,22 +1602,23 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                     if (!(cand_fu.inst->id == cand->id))
                                         continue;
                                 }
-                                /* WAR hazard check (same as §11.26 path):
-                                 * don't bypass cand if it writes a register
-                                 * that any instruction at positions 0..
-                                 * scan_idx-1 reads as a source.  Those
-                                 * instructions commit later (after this
-                                 * bypass) but are earlier in program order
-                                 * and must see the pre-write value. */
+                                /* Hazard check (same logic as §11.26 path):
+                                 * WAR + RAW + WAW — cand must be fully
+                                 * independent of all earlier instructions
+                                 * (positions 0..scan_idx-1) before it can
+                                 * be bypass-committed past them. */
                                 {
-                                    bool war_hazard = false;
+                                    bool hazard = false;
                                     if (cand->isInst()) {
                                         auto *isa =
                                             cpu.getContext(thread_id)
                                             ->getIsaPtr();
+                                        int cand_ns =
+                                            cand->staticInst->numSrcRegs();
+                                        int cand_nd =
+                                            cand->staticInst->numDestRegs();
                                         for (unsigned int chk = 0;
-                                             chk < scan_idx && !war_hazard;
-                                             chk++)
+                                             chk < scan_idx && !hazard; chk++)
                                         {
                                             QueuedInst *prev =
                                                 ex_info.inFlightInsts
@@ -1586,28 +1627,61 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                             MinorDynInstPtr pi = prev->inst;
                                             if (pi->isBubble() || pi->isFault()
                                                 || !pi->isInst()) continue;
-                                            int ns =
+                                            int pi_ns =
                                                 pi->staticInst->numSrcRegs();
-                                            int nd =
-                                                cand->staticInst->numDestRegs();
+                                            int pi_nd =
+                                                pi->staticInst->numDestRegs();
+                                            /* WAR: cand.dest ∩ prev.src */
                                             for (int si = 0;
-                                                 si < ns && !war_hazard; si++) {
-                                                RegId src =
+                                                 si < pi_ns && !hazard; si++) {
+                                                RegId psrc =
                                                     pi->staticInst->srcRegIdx(si)
                                                     .flatten(*isa);
                                                 for (int di = 0;
-                                                     di < nd && !war_hazard;
+                                                     di < cand_nd && !hazard;
                                                      di++) {
-                                                    if (src ==
+                                                    if (psrc ==
                                                         cand->staticInst
                                                         ->destRegIdx(di)
                                                         .flatten(*isa))
-                                                        war_hazard = true;
+                                                        hazard = true;
+                                                }
+                                            }
+                                            /* RAW: cand.src ∩ prev.dest */
+                                            for (int di = 0;
+                                                 di < pi_nd && !hazard; di++) {
+                                                RegId pdst =
+                                                    pi->staticInst->destRegIdx(di)
+                                                    .flatten(*isa);
+                                                for (int si = 0;
+                                                     si < cand_ns && !hazard;
+                                                     si++) {
+                                                    if (pdst ==
+                                                        cand->staticInst
+                                                        ->srcRegIdx(si)
+                                                        .flatten(*isa))
+                                                        hazard = true;
+                                                }
+                                            }
+                                            /* WAW: cand.dest ∩ prev.dest */
+                                            for (int di = 0;
+                                                 di < pi_nd && !hazard; di++) {
+                                                RegId pdst =
+                                                    pi->staticInst->destRegIdx(di)
+                                                    .flatten(*isa);
+                                                for (int cdi = 0;
+                                                     cdi < cand_nd && !hazard;
+                                                     cdi++) {
+                                                    if (pdst ==
+                                                        cand->staticInst
+                                                        ->destRegIdx(cdi)
+                                                        .flatten(*isa))
+                                                        hazard = true;
                                                 }
                                             }
                                         }
                                     }
-                                    if (war_hazard) continue;
+                                    if (hazard) continue;
                                 }
                                 DPRINTF(MinorExecute, "Bypass committing"
                                     " scalar inst %s past in-FU vector"

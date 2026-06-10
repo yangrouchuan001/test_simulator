@@ -3643,3 +3643,100 @@ path models this constraint.
 ### Files changed
 
 - src/cpu/minor/execute.cc: add WAR hazard check in both bypass scan locations
+
+---
+
+## §11.31 — Simulation still loops: RAW and WAW hazards in bypass commit (2026-06-10)
+
+### Symptom
+
+After §11.30's WAR fix, simulation still ran indefinitely (CPI ≈ 196, killed after
+70 s host time with ≈169 K instructions committed). The instruction mix shifted
+significantly compared to the first run: `SimdMultAcc` (vmacc) dropped from 98 to 0
+issued, `SimdMult` (vmul) appeared (45 issued, was 0), fewer vsetvl/vload committed.
+The changed mix confirms the program still takes a wrong code path due to wrong
+register values — a different hazard class than §11.30.
+
+### Root cause
+
+The §11.30 WAR check only blocked one of three data-hazard cases. Two remain:
+
+#### RAW hazard (the dominant remaining bug)
+
+The scoreboard marks V's dest registers as "available" after the **accept-time
+latency estimate** expires, even if V is still queued in `vectorPendingQueue` and
+has not actually executed. Because `execute()` runs at **commit time** (not at
+issue/dispatch time), this means:
+
+1. V is accepted into `vectorPendingQueue` at cycle T. `markupInstDests` sets
+   `returnCycle[V.dest] = T + opLat`.
+2. V is **not dispatched** immediately (FU busy). V remains in the pending queue.
+3. At cycle `T + opLat`, the scoreboard reports V.dest as free.
+4. Scalar S (program-order later than V, position `scan_idx` in `inFlightInsts`)
+   reads V.dest. Scoreboard says it's available → S issues and reaches its FU output.
+5. Bypass commit fires: S is at its FU output, V is at head. S passes WAR check
+   (S doesn't write V's sources). Bypass commits S.
+6. S calls `execute()` and reads V.dest = **pre-V value** (V hasn't committed yet).
+7. S computes wrong result. Wrong result corrupts computation → wrong branch → loop.
+
+#### WAW hazard
+
+If both V and S write the same register R, and S commits first (bypass):
+- S writes R = s_val
+- V commits later and writes R = v_val (overwrites S's write)
+- Final R = v_val, but correct program-order final value should be s_val (S is later)
+- Any instruction after S that reads R gets the wrong value (v_val instead of s_val)
+
+### Fix
+
+Replaced the WAR-only hazard check in **both** bypass scan paths (§11.26 and §11.27A)
+with a **full three-way independence check** (WAR + RAW + WAW). Bypass of `cand`
+past any earlier instruction `prev` (positions 0..scan_idx−1) is blocked if:
+
+```
+WAR: cand.dest ∩ prev.src  ≠ ∅  (cand writes what prev reads)
+RAW: cand.src  ∩ prev.dest ≠ ∅  (cand reads what prev will write)
+WAW: cand.dest ∩ prev.dest ≠ ∅  (cand and prev both write same reg)
+```
+
+A bypass is only allowed when `cand` is **fully independent** of every earlier
+instruction — no register overlap in any direction.
+
+```cpp
+/* WAR: cand.dest ∩ prev.src */
+for (si : prev.srcRegs)
+    for (di : cand.destRegs)
+        if (prev.src[si] == cand.dest[di]) hazard = true;
+
+/* RAW: cand.src ∩ prev.dest */
+for (di : prev.destRegs)
+    for (si : cand.srcRegs)
+        if (prev.dest[di] == cand.src[si]) hazard = true;
+
+/* WAW: cand.dest ∩ prev.dest */
+for (di : prev.destRegs)
+    for (cdi : cand.destRegs)
+        if (prev.dest[di] == cand.dest[cdi]) hazard = true;
+
+if (hazard) continue;   // skip this bypass candidate
+```
+
+All register comparisons use `flatten(*isa)` so the class (IntReg, VecReg, etc.)
+is included in the comparison. This correctly differentiates integer registers
+from vector registers with the same index number.
+
+Complexity: O(scan_idx × max(pi_ns, pi_nd) × max(cand_ns, cand_nd)) ≈ O(8 × 8 × 6)
+= O(384) comparisons per bypass candidate. Negligible simulation overhead.
+
+### RTL basis
+
+In the CoralNPU RTL's CQ/ROB, a scalar instruction S can only retire out-of-order
+ahead of a blocked vector V if they are **completely register-independent** — no
+RAW, WAR, or WAW dependency in either direction. The gem5 bypass commit must enforce
+the same independence condition. The previous WAR-only check was a partial
+implementation of this invariant.
+
+### Files changed
+
+- src/cpu/minor/execute.cc: expand both bypass hazard checks from WAR-only to
+  WAR + RAW + WAW in §11.26 (pendingFUDispatch path) and §11.27A (in-FU vector path)
