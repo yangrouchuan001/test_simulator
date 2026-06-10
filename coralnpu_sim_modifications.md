@@ -68,6 +68,7 @@
     - 11.23 [Timing regression fix — vslide* moved back to VEC\_ALU (pipelined) to compensate for missing scalar-vector overlap](#1123-timing-regression-fix--vslide-moved-back-to-vec_alu-pipelined-to-compensate-for-missing-scalar-vector-overlap)
     - 11.24–11.31 [OOO vector dispatch, bypass commit, hazard fixes (vectorPendingQueue)](#1124-1131-ooo-vector-dispatch-bypass-commit-hazard-fixes)
     - 11.32 [CPI=222 — branch bypass-commit causes repeated stream changes (~98% misprediction rate)](#1132-cpi222--branch-bypass-commit-causes-repeated-stream-changes)
+    - 11.33 [Permanent deadlock — vectorPendingQueue dispatches out-of-order microop, violating inFlightInsts ordering](#1133-permanent-deadlock--vectorpendingqueue-dispatches-out-of-order-microop)
 
 ---
 
@@ -90,7 +91,7 @@
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
-| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops to prevent branch instructions from being committed out-of-order |
+| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops; (§11.33) add `fuScoreboardBlocked` in pendingQueue dispatch loop to prevent out-of-order microop dispatch |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -3855,3 +3856,109 @@ spurious stream changes.
 - `src/cpu/minor/execute.cc`: add `isControl()` break in both bypass scan loops
   at §11.26 (pendingFUDispatch path, after the `isMemRef()` check) and §11.27A
   (in-FU vector path, after the `isMemRef()` check)
+
+---
+
+## §11.33 — Permanent deadlock: vectorPendingQueue dispatches out-of-program-order microop, causing inFlightInsts ordering violation (2026-06-10)
+
+### Symptom
+
+After applying §11.32, simulation stalls permanently. All four scalar ALU FUs
+(0–3) show "it's stalled" on every cycle, and the instruction at the front of the
+input buffer (`srli` at 0x18ec, stream 6481) can never issue. Simulation runs for
+14,000+ cycles in this state without making progress.
+
+### Root cause
+
+`vredsum.vs` decomposes into 5 microops:
+- `vpinvd_v_micro` (micro 0): prepare accumulator in FU 14
+- `vredsum_vs_micro` × 4 (micros 1–4): accumulate partial sums in FU 14
+
+When FU 14 was busy with `vpinvd_v_micro`, all four `vredsum_vs_micro` microops
+were deferred to `vectorPendingQueue` via the §11.25 path. However, micros 1–3
+were deferred at cycle 275504000, while micro 4 (`.239450`) was deferred one
+cycle later at 275505000. The deferral code calls `markupInstDests` with an
+optimistic latency estimate for each deferred instruction:
+
+```
+resultTime = curCycle + FU.opLat = 275504000 + 6 = 275510000  (micros 1–3)
+resultTime = curCycle + FU.opLat = 275505000 + 6 = 275511000  (micro 4)
+```
+
+All four `vredsum_vs_micro` microops write to the same accumulator register `vd`.
+The scoreboard tracks the **maximum** pending write time per register. After micro
+4's deferral, `scoreboard[vd] = 275511000`.
+
+At cycle 275510000, `vpinvd_v_micro` commits and FU 14 becomes free. The
+`vectorPendingQueue` dispatch loop processes micro 1 (`.239447`) first:
+
+1. FU 14 provides `VEC_PMTRDT` ✓, not stalled ✓, `canInsert()` = `275510000 ≤ 275510000` ✓
+2. `canInstIssue(.239447)`: checks source `vd` → `scoreboard[vd] = 275511000 > 275510000` → **FAIL**
+3. Loop advances to micro 2 (`.239448`)
+
+Micro 2's source register set does NOT include `vd` (the accumulation chaining
+between `vredsum_vs_micro` microops happens implicitly within the FU, with no
+explicit architectural register edge visible to the scoreboard). So:
+
+4. `canInstIssue(.239448)`: all sources ready → **PASS**
+5. `.239448` dispatches to FU 14
+
+Now `.239447` has `pendingFUDispatch=true, fuIndex=noCostFUIndex` and is at HEAD
+of `inFlightInsts`. `.239448` is at position 1. When `.239448` completes in FU 14:
+- FU 14 stalls (`.239448` output valid but `.239447` at HEAD, not committed)
+- HEAD `.239447` has no FU → `pendingFUDispatch` path: bypass scan finds only
+  `pendingFUDispatch` entries in positions 1–7 → no bypass → no commit
+- At 275511000, `scoreboard[vd] = 275511000 ≤ 275511000` → `.239447` could now
+  dispatch — but FU 14 is stalled (`.239448` blocking it) → FU 14 can't accept
+
+Permanent deadlock:
+- `.239447`: no FU (pendingFUDispatch), waiting for FU 14
+- FU 14: stalled with `.239448` output, waiting for `.239447` to commit
+- Scalar FUs 0–3: stalled with completed instructions, waiting for `.239447` at HEAD
+- `srli` at 0x18ec: all capable FUs stalled → never issues
+
+### Fix
+
+Added a per-FU `fuScoreboardBlocked` vector in the `vectorPendingQueue` dispatch
+loop. When item N fails `canInstIssue` for FU X (data dependency not yet met),
+FU X is marked blocked for the rest of this dispatch cycle. No later queue item
+can dispatch to FU X. This enforces program-order dispatch for microops that
+chain through the same FU with implicit (non-scoreboard-visible) dependencies:
+
+```cpp
+std::vector<bool> fuScoreboardBlocked(numFuncUnits, false);
+// ...
+if (fuScoreboardBlocked[pfu])
+    continue;
+if (!scoreboard.canInstIssue(pending_inst, ...)) {
+    fuScoreboardBlocked[pfu] = true;
+    continue;
+}
+```
+
+With this fix, at 275510000:
+- `.239447` fails `canInstIssue` for FU 14 → `fuScoreboardBlocked[14] = true`
+- `.239448`, `.239449`, `.239450`: FU 14 blocked → all skipped
+- No dispatch this cycle
+
+At 275511000:
+- `fuScoreboardBlocked` resets (new dispatch cycle)
+- `.239447` checks `canInstIssue`: `scoreboard[vd] = 275511000 ≤ 275511000` → **PASS**
+- `.239447` dispatches to FU 14
+
+Program order is maintained. The deadlock is avoided.
+
+### Why the earlier microops' scoreboard marks didn't protect against this
+
+The scoreboard tracks a single "latest completion time" per register, not
+per-instruction times. When `.239450` marked `vd` at 275511000, it overwrote the
+275510000 marks left by the earlier micros. The `canInstIssue` check for `.239447`
+sees `275511000` as the completion time for `vd` (its source), even though `.239447`
+itself is the first instruction to write `vd` after `vpinvd_v_micro`. The
+`fuScoreboardBlocked` fix sidesteps this by preventing any later micro from
+"overtaking" an earlier one when the earlier one is held back by the scoreboard.
+
+### Files changed
+
+- `src/cpu/minor/execute.cc`: add `fuScoreboardBlocked` vector and per-FU
+  scoreboard-blocked check in the `vectorPendingQueue` dispatch loop (§11.25 path)
