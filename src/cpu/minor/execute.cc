@@ -1453,6 +1453,11 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                 ex_info.streamSeqNum) continue;
                             /* Stop at any memory ref */
                             if (cand->isMemRef()) break;
+                            /* §11.32: Stop at control-flow instructions —
+                             * branches must commit in program order; bypass-
+                             * committing them causes incorrect stream changes */
+                            if (!cand->isFault() &&
+                                cand->staticInst->isControl()) break;
                             /* Skip vector instructions still in FUs */
                             if (!cand->isFault() &&
                                 cand->staticInst->isVector()) continue;
@@ -1593,6 +1598,10 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                 if (cand->id.streamSeqNum !=
                                     ex_info.streamSeqNum) continue;
                                 if (cand->isMemRef()) break;
+                                /* §11.32: Stop at control-flow instructions —
+                                 * branches must commit in program order */
+                                if (!cand->isFault() &&
+                                    cand->staticInst->isControl()) break;
                                 if (!cand->isFault() &&
                                     cand->staticInst->isVector()) continue;
                                 if (cand->fuIndex != noCostFUIndex) {

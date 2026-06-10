@@ -66,6 +66,8 @@
     - 11.21 [Unknown instruction 0x08000073 — MPAUSE SYSTEM-opcode encoding missing from decoder](#1121-unknown-instruction-0x08000073--mpause-system-opcode-encoding-missing-from-decoder)
     - 11.22 [Pipeline timing improvements — VEC\_PMTRDT non-pipelined FU + branch misprediction penalty corrected](#1122-pipeline-timing-improvements--vec_pmtrdt-non-pipelined-fu--branch-misprediction-penalty-corrected)
     - 11.23 [Timing regression fix — vslide* moved back to VEC\_ALU (pipelined) to compensate for missing scalar-vector overlap](#1123-timing-regression-fix--vslide-moved-back-to-vec_alu-pipelined-to-compensate-for-missing-scalar-vector-overlap)
+    - 11.24–11.31 [OOO vector dispatch, bypass commit, hazard fixes (vectorPendingQueue)](#1124-1131-ooo-vector-dispatch-bypass-commit-hazard-fixes)
+    - 11.32 [CPI=222 — branch bypass-commit causes repeated stream changes (~98% misprediction rate)](#1132-cpi222--branch-bypass-commit-causes-repeated-stream-changes)
 
 ---
 
@@ -88,7 +90,7 @@
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
-| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did) |
+| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops to prevent branch instructions from being committed out-of-order |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -3740,3 +3742,116 @@ implementation of this invariant.
 
 - src/cpu/minor/execute.cc: expand both bypass hazard checks from WAR-only to
   WAR + RAW + WAW in §11.26 (pendingFUDispatch path) and §11.27A (in-FU vector path)
+
+---
+
+## §11.32 — CPI=222: branch bypass-commit causes repeated stream changes (~98% misprediction rate) (2026-06-10)
+
+### Symptom
+
+Simulation of `main_dispatch_0_reduction_4096x1024_i8xi8xi32` produced correct
+output but ran at **CPI ≈ 222** — approximately 100× slower than the expected
+~2.3 CPI. Total simulated cycles: ~395M for a kernel expected to complete in ~4M.
+
+### Root cause
+
+The bypass-commit mechanism (§11.26 and §11.27A) scans positions 1..7 in
+`inFlightInsts` looking for scalar instructions to commit out-of-order past a
+blocked vector head. The scan logic correctly skips vector instructions and breaks
+at memory references — but it contained **no check for branch/control-flow
+instructions**.
+
+The inner loop of the kernel (0x1828–0x18e0, 47 instructions) ends with:
+
+```
+0x18e0: bltu t6, a0, 0x1828   # loop-back branch (taken 62/63 iterations)
+```
+
+After the §11.25–§11.31 changes, the typical inFlightInsts layout at the head is:
+
+| offset | instruction | state |
+|--------|-------------|-------|
+| 0 | `vslideup.vi` (VEC\_PMTRDT) | blocked at head — executing in FU 14 |
+| 1 | `vslideup.vi` (VEC\_PMTRDT) | pendingFUDispatch or in-FU |
+| 2 | `addi t5,t5,16` (ALU) | complete |
+| 3 | `bltu t6,a0,1828` (Branch) | complete |
+
+The bypass scan reaches offset 3 (`bltu`): it is not a fault, not a memory ref,
+not a vector instruction, its FU has completed it. The hazard check passes (the
+branch reads `t6` and `a0`, which have no RAW/WAR/WAW overlap with the nearby
+vector instructions writing vector registers). The branch is **bypass-committed
+out-of-order**, before the two `vslideup` instructions ahead of it.
+
+The branch predictor at index 0x60 (mapped from PC 0x18e0) had learned a
+NOT-taken prediction for this PC (prediction = 0). When the branch executes and
+produces a TAKEN result, gem5 detects a misprediction and increments
+`streamSeqNum`. All instructions already fetched/decoded under the old stream
+number are discarded. The pipeline refills from the branch target (0x1828).
+
+**This happens on every iteration where the branch is taken** — 62 out of 63
+inner loop iterations per outer iteration. Observed in debug trace:
+
+```
+275504000: system.cpu.branchPred.conditionalBranchPred: Looking up index 0x60
+275504000: system.cpu.branchPred.conditionalBranchPred: prediction is 0.
+```
+
+```
+275179000: system.cpu.execute: Discarding inst: 0/6471.23637/.../... pc: 0x1878
+  (vwmul_vv_micro) as its stream state was unexpected, expected: 6472
+```
+
+Between cycles 275179000 and 275503000 (~324 cycles), the stream number advanced
+from 6471 to 6481 — **10 mispredictions in 324 cycles**, consistent with one
+misprediction every ~32 cycles (inner loop body = ~32 instructions).
+
+Each misprediction discards all in-flight vector work (vslideup, vwmul, etc.) and
+restarts the pipeline, amplifying the branch penalty from the nominal 2-cycle
+redirect to effectively re-executing every vector instruction multiple times.
+
+### Secondary cause (minor)
+
+VecLSU FU stall also contributed: `vle8_v_micro` (isMemRef, cannot be deferred to
+`vectorPendingQueue`) found FU 8 (VecLSU) stalled waiting for the VEC\_PMTRDT at
+HEAD to commit. The next `vle8_v_micro` in the input buffer blocked all issue for
+~6 cycles per occurrence. However, the branch misprediction at ~62× per outer
+iteration was the dominant effect.
+
+### Fix
+
+Added an `isControl()` break in **both** bypass scan loops — the §11.26
+(pendingFUDispatch head) loop and the §11.27A (in-FU vector head) loop — before
+the existing `isVector()` skip check:
+
+```cpp
+/* §11.32: Stop at control-flow instructions — must commit in program order.
+ * Bypass-committing branches causes incorrect stream changes when the actual
+ * branch outcome differs from the predictor's in-order prediction. */
+if (!cand->isFault() && cand->staticInst->isControl()) break;
+```
+
+This prevents `bltu` (and any other branch/jump/call instruction) from being
+committed out-of-order past a blocked vector head. The branch now waits until all
+earlier vector instructions have committed, which is the correct program-order
+behaviour matching the RTL.
+
+### Why `isControl()` and not just `isBranch()`
+
+`isControl()` covers all control-flow instructions: conditional branches, jumps,
+calls, returns. Any of these would cause the same incorrect stream-change if
+bypass-committed ahead of a blocked vector that hasn't yet updated architectural
+state. Using `isControl()` is the conservatively correct fix.
+
+### Effect on correctness
+
+Without this fix, the branch executes and retires with the correct branch outcome
+(the computation is correct), but the out-of-order commit time triggers gem5's
+misprediction detection mechanism incorrectly. With the fix, branches wait for
+in-order commit and the branch predictor update happens at the right time — no
+spurious stream changes.
+
+### Files changed
+
+- `src/cpu/minor/execute.cc`: add `isControl()` break in both bypass scan loops
+  at §11.26 (pendingFUDispatch path, after the `isMemRef()` check) and §11.27A
+  (in-FU vector path, after the `isMemRef()` check)
