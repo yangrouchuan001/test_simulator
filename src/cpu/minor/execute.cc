@@ -302,8 +302,11 @@ Execute::updateBranchData(
 {
     if (reason != BranchData::NoBranch) {
         /* Bump up the stream sequence number on a real branch*/
-        if (BranchData::isStreamChange(reason))
+        if (BranchData::isStreamChange(reason)) {
             executeInfo[tid].streamSeqNum++;
+            /* Flush pending vector instructions from the wrong stream */
+            executeInfo[tid].vectorPendingQueue.clear();
+        }
 
         /* Branches (even mis-predictions) don't change the predictionSeqNum,
          *  just the streamSeqNum */
@@ -549,6 +552,87 @@ Execute::issue(ThreadID thread_id)
     if (!insts_in)
         return 0;
 
+    /* OOO vector dispatch: try to dispatch deferred vector instructions from
+     * the pending queue to free FUs. This models RTL RS-based OOO vector
+     * execution where each FU dispatches independently when deps are ready. */
+    {
+        auto it = thread.vectorPendingQueue.begin();
+        while (it != thread.vectorPendingQueue.end()) {
+            MinorDynInstPtr &pending_inst = *it;
+
+            /* Remove stale (wrong stream) or already-dispatched entries */
+            if (!pending_inst->pendingFUDispatch ||
+                pending_inst->id.streamSeqNum != thread.streamSeqNum) {
+                it = thread.vectorPendingQueue.erase(it);
+                continue;
+            }
+
+            bool dispatched = false;
+            for (unsigned pfu = 0; pfu < numFuncUnits && !dispatched; pfu++) {
+                FUPipeline *fu = funcUnits[pfu];
+
+                if (!fu->provides(pending_inst->staticInst->opClass()))
+                    continue;
+                if (fu->alreadyPushed() || fu->stalled || !fu->canInsert())
+                    continue;
+
+                MinorFUTiming *timing = fu->findTiming(pending_inst->staticInst);
+                if (timing && timing->suppress)
+                    continue;
+
+                const std::vector<Cycles> *src_lats =
+                    timing ? &timing->srcRegsRelativeLats : NULL;
+                const std::vector<bool> *cant_fwd =
+                    &fu->cantForwardFromFUIndices;
+
+                if (!scoreboard[thread_id].canInstIssue(pending_inst,
+                    src_lats, cant_fwd, cpu.curCycle(),
+                    cpu.getContext(thread_id)))
+                    continue;
+
+                /* Can dispatch to this FU.
+                 * Scoreboard was already marked at accept time (optimistic
+                 * estimate). Do NOT call markupInstDests again to keep the
+                 * numResults count balanced with clearInstDests at commit. */
+                Cycles extra_lat = timing ? timing->extraCommitLat : Cycles(0);
+                TimingExpr *extra_lat_expr =
+                    timing ? timing->extraCommitLatExpr : NULL;
+
+                QueuedInst fu_inst(pending_inst);
+                pending_inst->fuIndex = pfu;
+                pending_inst->extraCommitDelay = extra_lat;
+                pending_inst->extraCommitDelayExpr = extra_lat_expr;
+                pending_inst->pendingFUDispatch = false;
+
+                /* Update FU access stats (counted at dispatch, not accept) */
+                {
+                    auto sid = pending_inst->id.threadId;
+                    if (pending_inst->staticInst->isInteger())
+                        cpu.executeStats[sid]->numIntAluAccesses++;
+                    if (pending_inst->staticInst->isFloating())
+                        cpu.executeStats[sid]->numFpAluAccesses++;
+                    if (pending_inst->staticInst->isVector())
+                        cpu.executeStats[sid]->numVecAluAccesses++;
+                    issueStats.issuedInstType[sid][
+                        pending_inst->staticInst->opClass()]++;
+                }
+
+                fu->push(fu_inst);
+                cpu.activityRecorder->activity();
+
+                DPRINTF(MinorExecute,
+                    "Dispatching pending vector inst: %s to FU %d\n",
+                    *pending_inst, pfu);
+
+                dispatched = true;
+                it = thread.vectorPendingQueue.erase(it);
+            }
+
+            if (!dispatched)
+                ++it;
+        }
+    }
+
     /* Start from the first FU */
     unsigned int fu_index = 0;
 
@@ -786,6 +870,65 @@ Execute::issue(ThreadID thread_id)
 
             if (!issued)
                 DPRINTF(MinorExecute, "Didn't issue inst: %s\n", *inst);
+
+            /* OOO vector dispatch: if a non-memory vector instruction failed
+             * to issue because its FU was busy (not due to data dependency),
+             * defer it into vectorPendingQueue and keep scanning the input
+             * buffer. This models RTL scalar-vector decoupling where scalar
+             * dispatches continue while vectors queue in the RS/CQ. */
+            if (!issued && inst->isInst() && !inst->isMemRef() &&
+                inst->staticInst->isVector() &&
+                thread.vectorPendingQueue.size() < vectorPendingQueueSize)
+            {
+                /* Check if failure was FU-busy vs data-dependency-blocked.
+                 * If a capable FU exists but is free yet scoreboard blocked,
+                 * the bottleneck is data deps — keep in input buffer.
+                 * If all capable FUs are busy, defer to vectorPendingQueue. */
+                bool any_capable_fu_free = false;
+                bool any_capable_fu_exists = false;
+                for (unsigned fi = 0; fi < numFuncUnits; fi++) {
+                    FUPipeline *f = funcUnits[fi];
+                    if (!f->provides(inst->staticInst->opClass())) continue;
+                    any_capable_fu_exists = true;
+                    if (!f->alreadyPushed() && !f->stalled && f->canInsert()) {
+                        any_capable_fu_free = true;
+                        break;
+                    }
+                }
+
+                if (any_capable_fu_exists && !any_capable_fu_free) {
+                    DPRINTF(MinorExecute,
+                        "Deferring FU-blocked vector inst: %s to pending queue"
+                        " (queue depth %d)\n",
+                        *inst, (unsigned)thread.vectorPendingQueue.size());
+
+                    /* Use noCostFUIndex as fuIndex sentinel (not yet in FU).
+                     * Mark scoreboard now (accept-time, optimistic latency)
+                     * so clearInstDests remains balanced at commit time. */
+                    inst->pendingFUDispatch = true;
+                    inst->fuIndex = noCostFUIndex;
+
+                    /* Find first capable FU for latency estimate */
+                    for (unsigned fi = 0; fi < numFuncUnits; fi++) {
+                        FUPipeline *f = funcUnits[fi];
+                        if (!f->provides(inst->staticInst->opClass())) continue;
+                        MinorFUTiming *t = f->findTiming(inst->staticInst);
+                        Cycles el = t ? t->extraCommitLat : Cycles(0);
+                        Cycles ea = t ? t->extraAssumedLat : Cycles(0);
+                        scoreboard[thread_id].markupInstDests(inst,
+                            cpu.curCycle() + f->description.opLat + el + ea,
+                            cpu.getContext(thread_id), false);
+                        break;
+                    }
+
+                    QueuedInst fu_inst(inst);
+                    thread.inFlightInsts->push(fu_inst);
+                    thread.vectorPendingQueue.push_back(inst);
+
+                    issued = true;
+                    fu_index = 0; /* Reset so outer loop continues */
+                }
+            }
         }
 
         if (issued) {
@@ -1171,6 +1314,8 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
         bool completed_mem_ref = false;
         bool issued_mem_ref = false;
         bool early_memory_issue = false;
+        bool is_bypass_commit = false;
+        unsigned int bypass_scan_idx = 0;
 
         /* Must set this again to go around the loop */
         completed_inst = false;
@@ -1273,30 +1418,131 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
             /* Try to issue from the ends of FUs and the inFlightInsts
              *  queue */
             if (!completed_inst && !inst->inLSQ) {
-                DPRINTF(MinorExecute, "Trying to commit from FUs\n");
+                if (inst->pendingFUDispatch) {
+                    /* Instruction accepted to vectorPendingQueue but not yet
+                     * dispatched to an FU. If it's from a stale stream,
+                     * discard it; otherwise try to bypass-commit a scalar
+                     * instruction from behind it (RTL scalar-vector
+                     * retirement decoupling). */
+                    if (inst->id.streamSeqNum != ex_info.streamSeqNum) {
+                        DPRINTF(MinorExecute,
+                            "Discarding stale pending vector inst: %s\n",
+                            *inst);
+                        try_to_commit = true;
+                        completed_inst = true;
+                    } else {
+                        /* Scan ahead for a scalar instruction that can
+                         * be committed out-of-order past the pending vector.
+                         * Stop at any memory reference (ordering boundary). */
+                        static constexpr unsigned int bypassScanLimit = 8;
+                        for (unsigned int scan_idx = 1;
+                             scan_idx < bypassScanLimit && !try_to_commit;
+                             scan_idx++)
+                        {
+                            QueuedInst *scanned =
+                                ex_info.inFlightInsts->peekAt(scan_idx);
+                            if (!scanned) break;
+                            MinorDynInstPtr cand = scanned->inst;
+                            if (cand->isBubble()) continue;
+                            /* Skip other pending-dispatch vector insts */
+                            if (cand->pendingFUDispatch) continue;
+                            /* Stop at LSQ ops — memory ordering boundary */
+                            if (cand->inLSQ) break;
+                            /* Skip stale-stream instructions */
+                            if (cand->id.streamSeqNum !=
+                                ex_info.streamSeqNum) continue;
+                            /* Stop at any memory ref */
+                            if (cand->isMemRef()) break;
+                            /* Skip vector instructions still in FUs */
+                            if (!cand->isFault() &&
+                                cand->staticInst->isVector()) continue;
+                            /* For regular (non-no-cost) instructions,
+                             * verify the FU has completed execution */
+                            if (cand->fuIndex != noCostFUIndex) {
+                                QueuedInst &fu_inst =
+                                    funcUnits[cand->fuIndex]->front();
+                                if (fu_inst.inst->isBubble()) continue;
+                                if (!(fu_inst.inst->id == cand->id))
+                                    continue;
+                            }
+                            DPRINTF(MinorExecute, "Bypass committing"
+                                " scalar inst %s past pending vector"
+                                " head\n", *cand);
+                            inst = cand;
+                            try_to_commit = true;
+                            completed_inst = true;
+                            is_bypass_commit = true;
+                            bypass_scan_idx = scan_idx;
+                        }
+                        /* If no bypassable scalar found, stall */
+                    }
+                } else {
+                    DPRINTF(MinorExecute, "Trying to commit from FUs\n");
 
-                /* Try to commit from a functional unit */
-                /* Is the head inst of the expected inst's FU actually the
-                 *  expected inst? */
-                QueuedInst &fu_inst =
-                    funcUnits[inst->fuIndex]->front();
-                InstSeqNum fu_inst_seq_num = fu_inst.inst->id.execSeqNum;
+                    /* Try to commit from a functional unit */
+                    /* Is the head inst of the expected inst's FU actually the
+                     *  expected inst? */
+                    QueuedInst &fu_inst =
+                        funcUnits[inst->fuIndex]->front();
+                    InstSeqNum fu_inst_seq_num = fu_inst.inst->id.execSeqNum;
 
-                if (fu_inst.inst->isBubble()) {
-                    /* No instruction ready */
-                    completed_inst = false;
-                } else if (fu_inst_seq_num != head_exec_seq_num) {
-                    /* Past instruction: we must have already executed it
-                     * in the same cycle and so the head inst isn't
-                     * actually at the end of its pipeline
-                     * Future instruction: handled above and only for
-                     * mem refs on their way to the LSQ */
-                } else if (fu_inst.inst->id == inst->id)  {
-                    /* All instructions can be committed if they have the
-                     *  right execSeqNum and there are no in-flight
-                     *  mem insts before us */
-                    try_to_commit = true;
-                    completed_inst = true;
+                    if (fu_inst.inst->isBubble()) {
+                        /* No instruction at FU output: still in pipeline.
+                         * If the head is a vector instruction, try to
+                         * bypass-commit a scalar from behind it (RTL
+                         * scalar-vector retirement decoupling). */
+                        if (!inst->isFault() && inst->isInst() &&
+                            inst->staticInst->isVector())
+                        {
+                            static constexpr unsigned int bypassScanLimit = 8;
+                            for (unsigned int scan_idx = 1;
+                                 scan_idx < bypassScanLimit && !try_to_commit;
+                                 scan_idx++)
+                            {
+                                QueuedInst *scanned =
+                                    ex_info.inFlightInsts->peekAt(scan_idx);
+                                if (!scanned) break;
+                                MinorDynInstPtr cand = scanned->inst;
+                                if (cand->isBubble()) continue;
+                                if (cand->pendingFUDispatch) continue;
+                                if (cand->inLSQ) break;
+                                if (cand->id.streamSeqNum !=
+                                    ex_info.streamSeqNum) continue;
+                                if (cand->isMemRef()) break;
+                                if (!cand->isFault() &&
+                                    cand->staticInst->isVector()) continue;
+                                if (cand->fuIndex != noCostFUIndex) {
+                                    QueuedInst &cand_fu =
+                                        funcUnits[cand->fuIndex]->front();
+                                    if (cand_fu.inst->isBubble()) continue;
+                                    if (!(cand_fu.inst->id == cand->id))
+                                        continue;
+                                }
+                                DPRINTF(MinorExecute, "Bypass committing"
+                                    " scalar inst %s past in-FU vector"
+                                    " head\n", *cand);
+                                inst = cand;
+                                try_to_commit = true;
+                                completed_inst = true;
+                                is_bypass_commit = true;
+                                bypass_scan_idx = scan_idx;
+                            }
+                        }
+                        if (!try_to_commit)
+                            completed_inst = false;
+                    } else if (fu_inst_seq_num != head_exec_seq_num) {
+                        /* Past instruction: we must have already executed it
+                         * in the same cycle and so the head inst isn't
+                         * actually at the end of its pipeline
+                         * Future instruction: handled above and only for
+                         * mem refs on their way to the LSQ */
+                    } else if (fu_inst.inst->id == inst->id)  {
+                        /* All instructions can be committed if they have the
+                         *  right execSeqNum and there are no in-flight
+                         *  mem insts before us */
+                        try_to_commit = true;
+                        completed_inst = true;
+                    }
                 }
             }
 
@@ -1433,7 +1679,11 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
 
             /* Finished with the inst, remove it from the inst queue and
              *  clear its dependencies */
-            ex_info.inFlightInsts->pop();
+            if (is_bypass_commit) {
+                ex_info.inFlightInsts->removeAt(bypass_scan_idx);
+            } else {
+                ex_info.inFlightInsts->pop();
+            }
 
             /* Complete barriers in the LSQ/move to store buffer */
             if (inst->isInst() && inst->staticInst->isFullMemBarrier()) {

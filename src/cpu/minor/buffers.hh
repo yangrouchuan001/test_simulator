@@ -504,6 +504,18 @@ class Queue : public Named, public Reservable
     /** Pop the head item.  Like std::queue::pop */
     void pop() { queue.pop_front(); }
 
+    /** Peek at element at offset from front (0 = front).
+     *  Returns nullptr if offset is out of range. */
+    ElemType* peekAt(unsigned int offset) {
+        return (offset < queue.size()) ? &queue[offset] : nullptr;
+    }
+
+    /** Remove element at the given offset from front. */
+    void removeAt(unsigned int offset) {
+        if (offset < queue.size())
+            queue.erase(queue.begin() + offset);
+    }
+
     /** Is the queue empty? */
     bool empty() const { return queue.empty(); }
 

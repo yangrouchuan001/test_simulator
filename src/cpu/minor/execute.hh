@@ -45,6 +45,7 @@
 #ifndef __CPU_MINOR_EXECUTE_HH__
 #define __CPU_MINOR_EXECUTE_HH__
 
+#include <deque>
 #include <vector>
 
 #include "base/named.hh"
@@ -118,6 +119,10 @@ class Execute : public Named
      *  which pass the MinorDynInst::isNoCostInst test */
     unsigned int noCostFUIndex;
 
+    /** Maximum depth of the per-thread vector pending queue. Models the
+     *  RTL's combined CQ+UQ in-flight vector instruction capacity (16). */
+    static constexpr unsigned int vectorPendingQueueSize = 16;
+
     /** Dcache port to pass on to the CPU.  Execute owns this */
     LSQ lsq;
 
@@ -179,6 +184,11 @@ class Execute : public Named
         /** Index that we've completed upto in getInput data.  We can say we're
          *  popInput when this equals getInput()->width() */
         unsigned int inputIndex;
+
+        /** Vector instructions accepted for dispatch but waiting for a free FU.
+         *  Models RTL scalar-vector decoupling: scalar dispatch continues while
+         *  vector instructions queue in the reservation station (RS) / CQ. */
+        std::deque<MinorDynInstPtr> vectorPendingQueue;
 
         /** The last commit was the end of a full instruction so an interrupt
          *  can safely happen */

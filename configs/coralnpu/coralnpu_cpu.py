@@ -29,24 +29,22 @@
 #     total latency = 3 cy fixed overhead (DE2-FF + ROB-FF + VRF-FF)
 #                   + EX cycles per unit
 #     v-to-v chain penalty = opLat - srcRegsRelativeLat
-#       ALU/MUL/PMTRDT: opLat - 2 = 3 cy  (ROB bypass fires 1 cy early)
-#       Note: PMTRDT srcRelLat=3 to give same 3cy chain as ALU/MUL
+#       ALU/MUL:   opLat(5) - srcRelLat(2) = 3 cy  (ROB bypass fires 1 cy early)
+#       PMTRDT:    opLat(6) - srcRelLat(3) = 3 cy  (same chain as ALU/MUL)
 #
-#   RVV FUs (from rvv_backend_define.svh: NUM_ALU=2, NUM_MUL=2, NUM_DIV=1, NUM_PMTRDT=1):
-#     VEC_ALU    × 2  opLat=5  II=1   (2 ALUs; vadd/vsub/vshift/vcmp/vslide/vreduce-int)
-#     VEC_MUL    × 2  opLat=5  II=1   (2 MULs; vmul/vmacc/vfadd/vfmul/vreduce-fp)
-#     VEC_DIV    × 1  opLat=35 II=35  (1 non-pipelined DIV, EX≈32cy)
-#     VecLSU     × 1  opLat=5cy total (shared port, 5cy DTCM)
+#   RVV FUs (from rvv_backend_define.svh: NUM_ALU=2, NUM_MUL=2,
+#            NUM_PMTRDT=1, NUM_DIV=1):
+#     VEC_ALU    × 2  opLat=5  II=1   CMP+ALU exe_unit (element-wise arith/logic/cmp)
+#     VEC_MUL    × 2  opLat=5  II=1   MUL+MAC exe_unit (multiply/MAC/float-arith)
+#     VEC_PMTRDT × 1  opLat=6  II=6   MISC+PMT+RDT exe_unit (permute/reduce/misc)
+#     VEC_DIV    × 1  opLat=35 II=35  DIV exe_unit (non-pipelined)
+#     VecLSU     × 1  opLat=5cy total LSU exe_unit (5cy DTCM)
 #
-#   Note: PMTRDT (non-pipelined reduction/permutation) removed — gem5 MinorCPU
-#   has no scalar-vector overlap, so a non-pipelined PMTRDT causes 1.6-2.1×
-#   excess cycles vs RTL (tested §11.22-§11.23). All vector ops kept pipelined.
-#
-#   Known limitation: scalar–vector overlap (scalar core continues while
-#   RVV co-processor runs) is NOT modelled. Scalar instructions serialise
-#   behind vector in gem5's MinorCPU. Mixed scalar/vector IPC is
-#   underestimated by 20–50%. Pure-vector loop timing is approximately
-#   correct (< 15% error on single-uop operations).
+#   Scalar-vector decoupling (§11.25-§11.27):
+#     Scalar instructions bypass stalled/pending vector ops at BOTH issue and
+#     retirement, matching RTL CQ/UQ/ROB decoupled scalar-vector retirement.
+#     The vectorPendingQueue acts as the PMTRDT RS (depth 4 → modelled by
+#     vectorPendingQueueSize=16 which also covers ALU/MUL RS).
 #
 # References:
 #   coralnpu/doc/microarch/microarch.md
@@ -187,9 +185,14 @@ _CoralNPU_VecLSU = MinorFU(
         "SimdStridedStore",                 # vsse<eew>.v
         "SimdIndexedLoad",                  # vluxei/vloxei
         "SimdIndexedStore",                 # vsuxei/vsoxei
-        "SimdUnitStrideFaultOnlyFirstLoad", # vle<eew>ff.v
-        "SimdWholeRegisterLoad",            # vl<n>r.v
-        "SimdWholeRegisterStore",           # vs<n>r.v
+        "SimdUnitStrideFaultOnlyFirstLoad",          # vle<eew>ff.v
+        "SimdWholeRegisterLoad",                     # vl<n>r.v
+        "SimdWholeRegisterStore",                    # vs<n>r.v
+        "SimdUnitStrideSegmentedLoad",               # vlseg2e8.v … vlseg8e64.v
+        "SimdUnitStrideSegmentedStore",              # vsseg2e8.v … vsseg8e64.v
+        "SimdUnitStrideSegmentedFaultOnlyFirstLoad", # vlseg<n>e<eew>ff.v
+        "SimdStrideSegmentedLoad",                   # vlsseg<n>e<eew>.v
+        "SimdStrideSegmentedStore",                  # vssseg<n>e<eew>.v
     ]),
     opLat=1,
     issueLat=1,
@@ -231,28 +234,20 @@ _CoralNPU_VecLSU = MinorFU(
 #   NUM_ALU = 2,  NUM_MUL = 2,  NUM_DIV = 1
 # ════════════════════════════════════════════════════════════════════════════
 
-# VEC_ALU × 2 — integer arithmetic, logic, shift, compare, convert, mask ops,
-#               reductions, permutations (vslide*/vrgather), and vsetvl* config.
+# VEC_ALU × 2 — RTL exe_unit: CMP + ALU
+#   Handles element-wise integer arithmetic, logic, shift, compare, convert,
+#   and vsetvl config.  Matches RTL ALU RS (rs_ready_alu2dp).
 # opLat=5 (3 overhead + 2 EX). II=1 (pipelined). srcRelLats=[2,2] → v-to-v=3cy.
-# NOTE: gem5 MinorCPU has no scalar-vector overlap, so all vector ops are kept
-#       pipelined here (II=1) to avoid overcounting stalls that the RTL hides
-#       via concurrent scalar execution. A separate non-pipelined PMTRDT FU was
-#       tried (§11.22-§11.23) but caused 1.6-2.1× excess cycles vs RTL.
 def _make_CoralNPU_VEC_ALU():
     return MinorFU(
         opClasses=_make_op_class_set([
-            "SimdAdd",          # vadd, vsub, vrsub, vneg
-            "SimdAlu",          # vand, vor, vxor, vnot
-            "SimdCmp",          # vmseq, vmsne, vmsltu, vmslt, vmsleu, vmsle, vmsgtu, vmsgt
-            "SimdMisc",         # vmv.v.*, vmerge, vfirst, vmsbf, vmsif, vmsof, vid, viota
-            "SimdShift",        # vsll, vsrl, vsra, vnsrl, vnsra
-            "SimdShiftAcc",     # vssrl, vssra (shift with rounding)
-            "SimdCvt",          # vzext, vsext (zero/sign extend)
-            "SimdConfig",       # vsetvl, vsetvli, vsetivli
-            "SimdExt",          # vslideup, vslidedown, vslide1up, vslide1down, vrgather
-            "SimdFloatExt",     # vfslide1up, vfslide1down, vfrgather
-            "SimdReduceAlu",    # vredand, vredor, vredxor, vredmin/u, vredmax/u
-            "SimdReduceCmp",    # vredminu, vredmaxu
+            "SimdAdd",          # vadd, vsub, vrsub, vneg         — ALU
+            "SimdAlu",          # vand, vor, vxor, vnot           — ALU
+            "SimdCmp",          # vmseq/vmsne/vmsltu/… (→ mask)   — CMP
+            "SimdShift",        # vsll, vsrl, vsra, vnsrl, vnsra  — ALU
+            "SimdShiftAcc",     # vssrl, vssra (rounding shift)   — ALU
+            "SimdCvt",          # vzext, vsext                    — ALU
+            "SimdConfig",       # vsetvl, vsetvli, vsetivli       — special
         ]),
         opLat=5,
         issueLat=1,
@@ -262,27 +257,25 @@ def _make_CoralNPU_VEC_ALU():
         )],
     )
 
-# VEC_MUL × 2 — integer multiply/MAC, dot-product, float arithmetic, and
-#               float/integer reductions (pipelined; see VEC_ALU comment).
+# VEC_MUL × 2 — RTL exe_unit: MUL + MAC
+#   Handles integer multiply/MAC, dot-product, and float arithmetic.
+#   Matches RTL MUL RS (rs_ready_mul2dp).
 # opLat=5 (3 overhead + 2 EX). II=1 (pipelined). srcRelLats=[2,2] → v-to-v=3cy.
 def _make_CoralNPU_VEC_MUL():
     return MinorFU(
         opClasses=_make_op_class_set([
-            "SimdMult",             # vmul, vmulh, vmulhu, vmulhsu
-            "SimdMultAcc",          # vmacc, vnmsac, vmadd, vnmsub
-            "SimdAddAcc",           # vsadd, vsaddu, vssub, vssubu (saturating)
-            "SimdDotProd",          # vdot (if available)
-            "SimdReduceAdd",        # vredsum, vwredsum, vwredsumu
-            # Floating-point
+            "SimdMult",             # vmul, vmulh, vmulhu, vmulhsu      — MUL
+            "SimdMultAcc",          # vmacc, vnmsac, vmadd, vnmsub       — MAC
+            "SimdAddAcc",           # vsadd, vsaddu, vssub, vssubu       — ALU (saturation)
+            "SimdDotProd",          # vdot                               — MAC
+            # Floating-point (RTL: FMA/FNCMP/FCMP/FTBL/FCVT exe_unit, ZVE32F_ON)
             "SimdFloatAdd",         # vfadd, vfsub, vfrsub
-            "SimdFloatAlu",         # vfsgnj, vfsgnjn, vfsgnjx, vfmin, vfmax
+            "SimdFloatAlu",         # vfsgnj*, vfmin, vfmax
             "SimdFloatCmp",         # vmfeq, vmfne, vmflt, vmfle, vmfgt, vmfge
             "SimdFloatCvt",         # vfcvt.*, vfwcvt.*, vfncvt.*
             "SimdFloatMisc",        # vfmerge, vfmv.*
             "SimdFloatMult",        # vfmul, vfwmul
-            "SimdFloatMultAcc",     # vfmacc, vfnmacc, vfmsac, vfnmsac, vfmadd, vfnmadd
-            "SimdFloatReduceAdd",   # vfredosum, vfredusum, vfwredosum
-            "SimdFloatReduceCmp",   # vfredmin, vfredmax
+            "SimdFloatMultAcc",     # vfmacc, vfnmacc, vfmsac, vfnmsac, …
         ]),
         opLat=5,
         issueLat=1,
@@ -291,6 +284,46 @@ def _make_CoralNPU_VEC_MUL():
             srcRegsRelativeLats=[2, 2],
         )],
     )
+
+# VEC_PMTRDT × 1 — RTL exe_unit: MISC + PMT + RDT
+#   Handles permutation (vslide*, vrgather), reduction (vred*), and
+#   miscellaneous ops (vmv.v.*, vmerge, viota, vid, vfirst, vmsbf/vmsif/vmsof).
+#   Matches RTL PMTRDT RS (rs_ready_pmtrdt2dp, NUM_PMTRDT=1, PMTRDT_RS_DEPTH=4).
+#
+#   Latency (from rvv_backend_pmtrdt_unit.sv, VLENB=16B = VLEN=128):
+#     Permutation/MISC: 2 EX → 3+2 = 5 cy  ("2-cycle for each uop" comment)
+#     Reduction:        3 EX → 3+3 = 6 cy  (log2 tree: 2+log2(VLENB/8) stages)
+#   Using worst-case opLat=6 (reduction).  Permutation/MISC are over-conservative
+#   by 1 cy, but with bypass commit (§11.26/§11.27) scalar retirement is unaffected.
+#
+#   v-to-v chain: opLat(6) - srcRelLat(3) = 3 cy  (same as ALU/MUL).
+#   issueLat=6: non-pipelined, 1 instruction at a time through the unit.
+#     The vectorPendingQueue (§11.25) acts as the 4-deep RS: instructions
+#     queue there while the unit executes, dispatching when the FU is free.
+def _make_CoralNPU_VEC_PMTRDT():
+    return MinorFU(
+        opClasses=_make_op_class_set([
+            # MISC (RTL: MISC → PMTRDT RS)
+            "SimdMisc",             # vmv.v.i/x/v, vmerge, vfirst, vmsbf/vmsif/vmsof, vid, viota, vcpop
+            # PMT — permutation (RTL: PMT → PMTRDT RS)
+            "SimdExt",              # vslideup, vslidedown, vslide1up, vslide1down, vrgather, vcompress
+            "SimdFloatExt",         # vfslide1up, vfslide1down, vfrgather
+            # RDT — integer reduction (RTL: RDT → PMTRDT RS)
+            "SimdReduceAlu",        # vredand, vredor, vredxor, vredmin/u, vredmax/u
+            "SimdReduceCmp",        # vredminu, vredmaxu (alias in gem5)
+            "SimdReduceAdd",        # vredsum, vwredsum, vwredsumu
+            # RDT — float reduction (RTL: RDT → PMTRDT RS, ZVE32F_ON)
+            "SimdFloatReduceAdd",   # vfredosum, vfredusum, vfwredosum
+            "SimdFloatReduceCmp",   # vfredmin, vfredmax
+        ]),
+        opLat=6,
+        issueLat=6,
+        timings=[MinorFUTiming(
+            description="CoralNPU_VEC_PMTRDT",
+            srcRegsRelativeLats=[3, 3],  # v-to-v chain = 6-3 = 3cy (same as ALU/MUL)
+        )],
+    )
+
 
 # VEC_DIV × 1 — integer divide/remainder and float divide/sqrt.
 # Non-pipelined: EX ≈ 32 cy + 3 cy overhead = 35 cy total.
@@ -325,11 +358,12 @@ CoralNPU_FUPool = MinorFUPool(funcUnits=[
     _CoralNPU_VecLSU,       # vector memory: 5-cy DTCM latency
     _CoralNPU_CSR,          # System / CSR / serialising
     # ── RVV co-processor units ──────────────────────────────────────────────
-    _make_CoralNPU_VEC_ALU(),   # RVV ALU instance 0  (NUM_ALU=2 in RTL)
-    _make_CoralNPU_VEC_ALU(),   # RVV ALU instance 1
-    _make_CoralNPU_VEC_MUL(),   # RVV MUL instance 0  (NUM_MUL=2 in RTL)
-    _make_CoralNPU_VEC_MUL(),   # RVV MUL instance 1
-    _CoralNPU_VEC_DIV,          # RVV DIV instance 0  (NUM_DIV=1 in RTL)
+    _make_CoralNPU_VEC_ALU(),    # RVV ALU instance 0  (NUM_ALU=2 in RTL)
+    _make_CoralNPU_VEC_ALU(),    # RVV ALU instance 1
+    _make_CoralNPU_VEC_MUL(),    # RVV MUL instance 0  (NUM_MUL=2 in RTL)
+    _make_CoralNPU_VEC_MUL(),    # RVV MUL instance 1
+    _make_CoralNPU_VEC_PMTRDT(), # RVV PMTRDT instance 0  (NUM_PMTRDT=1 in RTL)
+    _CoralNPU_VEC_DIV,           # RVV DIV instance 0  (NUM_DIV=1 in RTL)
 ])
 
 
@@ -349,7 +383,7 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     executeIssueLimit            = 4           (max 4 issues/cycle)
     executeMemoryIssueLimit      = 1           (1 LSU op/cycle)
     executeCommitLimit           = 4
-    executeInputBufferSize       = 8           (matches ROB = 8 entries)
+    executeInputBufferSize       = 16          (RTL CQ(8)+UQ(16) scalar-vector decoupling)
     executeBranchDelay           = 2           (2-cycle branch flush; RTL: 2 fetch cycles)
     executeLSQTransfersQueueSize = 8           (LSU queue depth)
 
@@ -392,7 +426,7 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     executeMemoryIssueLimit = 1        # 1 LSU dispatch/cycle
     executeCommitLimit = 4
     executeMemoryCommitLimit = 1
-    executeInputBufferSize = 8         # ROB depth = 8
+    executeInputBufferSize = 16        # RTL CQ(8)+UQ(16) decoupling depth; increased from 8
 
     executeBranchDelay = 2           # RTL: 2 fetch cycles flushed on mispredict
     executeAllowEarlyMemoryIssue = False

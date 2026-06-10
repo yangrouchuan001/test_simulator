@@ -3207,3 +3207,300 @@ SimdExt and SimdFloatExt (vslide*, vfslide*, vrgather) remain in VEC_ALU (added 
 
 **Files modified (Python only — no rebuild required):**
 - configs/coralnpu/coralnpu_cpu.py
+
+
+---
+
+### 11.25 OOO vector dispatch — scalar-vector pipeline decoupling
+
+**Context**
+
+After §11.24, gem5 is at ~5.5M cycles (0.89× RTL). This change makes the
+MinorCPU pipeline model more faithfully reflect the CoralNPU RTL architecture:
+
+1. **Scalar-vector decoupling**: scalar dispatch continues while vectors queue
+   in CQ (depth 8) and per-FU reservation stations — scalar never stalls for
+   a busy vector FU.
+
+2. **OOO vector execution**: each FU (VEC_ALU×2, VEC_MUL×2, etc.) has an
+   independent RS; instructions dispatch when operands ready, regardless of
+   program order within the vector backend.
+
+The original gem5 MinorCPU in-order issue stops scanning when any instruction
+cannot issue (FU busy), serializing both scalar and different-FU-type vectors.
+
+**Implementation — vectorPendingQueue**
+
+Four files modified; C++ rebuild required.
+
+`dyn_inst.hh`: added `bool pendingFUDispatch = false` to MinorDynInst.
+
+`execute.hh`: added `#include <deque>`; added to ExecuteThreadInfo:
+  `std::deque<MinorDynInstPtr> vectorPendingQueue`.
+  Added constant: `static constexpr unsigned int vectorPendingQueueSize = 16`.
+
+`execute.cc` — four changes:
+1. `updateBranchData()`: `vectorPendingQueue.clear()` on stream change.
+2. `issue()` dispatch pass (start of function): scan vectorPendingQueue each
+   cycle; dispatch to free FU when canInstIssue passes. FU stats counted here.
+3. `issue()` defer path (after inner FU scan): FU-blocked non-memory vector
+   instructions are pushed to vectorPendingQueue AND inFlightInsts (program
+   order); issued=true lets outer loop continue past them (scalar bypass).
+   markupInstDests called at accept time (optimistic estimate) to balance
+   clearInstDests at commit.
+4. `commit()`: pendingFUDispatch guard before funcUnits[fuIndex] access;
+   stale-stream pending instructions are discarded cleanly.
+
+`coralnpu_cpu.py`: `executeInputBufferSize` 8 → 16 (models RTL CQ+UQ depth).
+
+**Correctness properties**
+- Commit order: instructions enter inFlightInsts in program order at accept.
+- Data deps: canInstIssue checked at dispatch time in pending queue pass.
+- Scoreboard balance: markupInstDests once (accept), clearInstDests once (commit).
+- Stream changes: clear() on branch + stream-check in dispatch loop.
+- No OOB FU access: fuIndex = noCostFUIndex; commit guarded by pendingFUDispatch.
+
+**Expected effect**
+Scalar instructions bypass blocked vectors. VEC_ALU and VEC_MUL dispatch
+independently in the same cycle. For the conv test (~5.5M pre): cycle count
+may decrease (OOO parallelism) — model is architecturally more accurate for
+general mixed scalar+vector workloads even if this specific test diverges.
+
+**Files modified (rebuild required):**
+- src/cpu/minor/dyn_inst.hh
+- src/cpu/minor/execute.hh
+- src/cpu/minor/execute.cc
+- configs/coralnpu/coralnpu_cpu.py (executeInputBufferSize 8→16)
+
+---
+
+## §11.26 — Scalar bypass-commit past pending vector instructions (2026-06-09)
+
+### Problem
+
+After §11.25, vector instructions are deferred into `vectorPendingQueue` when all
+capable FUs are busy. Such instructions sit at the head of `inFlightInsts` with
+`pendingFUDispatch = true`. The single-FIFO commit loop exits as soon as
+`completed_inst` stays false, so any scalar instruction queued behind a pending
+vector is blocked from retiring until the vector finally dispatches and completes.
+This is incorrect: the RTL CoralNPU retires scalars independently of in-flight vectors.
+
+### Root cause
+
+`commit()` always processes `inFlightInsts` from the head. When the head has
+`pendingFUDispatch = true` (and the stream is valid), `completed_inst` remains false
+and the while loop stops. Scalar instructions behind it are never examined.
+
+### Fix — three file changes
+
+#### 1. src/cpu/minor/buffers.hh — random-access to Queue
+
+Added two public methods to the `Queue<ElemType>` class (after `pop()`):
+
+    ElemType* peekAt(unsigned int offset)
+        returns &queue[offset], or nullptr if out of range
+
+    void removeAt(unsigned int offset)
+        queue.erase(queue.begin() + offset)
+
+These expose the underlying `std::deque` for targeted out-of-order removal.
+
+#### 2. src/cpu/minor/execute.cc — bypass scan in commit() (pendingFUDispatch block)
+
+Two new variables added at the top of each commit-loop iteration:
+`is_bypass_commit` (bool, init false) and `bypass_scan_idx` (unsigned int, init 0).
+
+When the head of `inFlightInsts` has `pendingFUDispatch = true` and belongs to the
+current stream, the code now scans up to 8 positions ahead (bypassScanLimit = 8)
+looking for a scalar instruction ready to bypass-commit. Scan rules (in order):
+
+| Condition | Action |
+|---|---|
+| `isBubble()` | continue (skip) |
+| `pendingFUDispatch` | continue (skip, another pending vector) |
+| `inLSQ` | break (memory ordering boundary) |
+| stale `streamSeqNum` | continue (skip) |
+| `isMemRef()` | break (memory ordering boundary) |
+| `isVector()` (non-fault) | continue (skip, vector still in FU) |
+| `fuIndex != noCostFUIndex` and FU not yet done | continue (skip) |
+| otherwise | bypass candidate — commit it |
+
+When a candidate is found, `inst` is re-pointed to the candidate,
+`try_to_commit = true`, `completed_inst = true`, `is_bypass_commit = true`,
+and `bypass_scan_idx` = scan position. The existing `try_to_commit` handling
+(timing checks, `commitInst()`, FU unstall) then runs on the candidate.
+
+#### 3. src/cpu/minor/execute.cc — conditional removal at the pop point
+
+    // was: ex_info.inFlightInsts->pop();
+    if (is_bypass_commit) {
+        ex_info.inFlightInsts->removeAt(bypass_scan_idx);
+    } else {
+        ex_info.inFlightInsts->pop();
+    }
+
+Removes the bypassed scalar from its actual position in the queue rather than
+always popping the head.
+
+### Correctness notes
+
+* **Execution already complete** — by the time a bypass candidate is at the end
+  of its FU pipeline, it has fully executed. Its register reads happened at issue
+  time. Committing it early (before the pending vector at the head) is safe.
+* **Memory ordering** — the scan stops at `inLSQ` and `isMemRef()`, so scalars
+  never bypass past pending memory operations.
+* **Scoreboard balance** — `clearInstDests` is called on `inst` (the bypass
+  candidate), matching the `markupInstDests` called at issue time. The pending
+  vector at the head is unaffected; its own `clearInstDests` fires when it
+  eventually commits normally.
+* **FU unstall** — the `funcUnits[inst->fuIndex]->stalled = false` path in the
+  existing `if (completed_inst)` block uses the updated `inst` (bypass candidate),
+  correctly unstalling the candidate's FU.
+* **Stream flush** — `is_bypass_commit` is reset to `false` each iteration, so
+  stale-stream discard of the head never triggers `removeAt`.
+
+### Scan limit
+
+`bypassScanLimit = 8` matches the RTL CQ depth. Scalars more than 8 positions
+behind a pending vector are not bypassed in the same cycle; they become eligible
+as earlier scalars retire.
+
+---
+
+## §11.27 — Restore PMTRDT FU + extend bypass to in-FU vector case (2026-06-09)
+
+### RTL analysis (rvv_backend_define.svh / rvv_backend_dispatch_ctrl.sv)
+
+The RTL dispatches vector uops to five RS classes:
+
+| RTL exe_unit | RS depth | gem5 FU |
+|---|---|---|
+| CMP, ALU | ALU_RS_DEPTH=8 | VEC_ALU (opLat=5, II=1) |
+| MUL, MAC | MUL_RS_DEPTH=8 | VEC_MUL (opLat=5, II=1) |
+| MISC, PMT, RDT | PMTRDT_RS_DEPTH=4 | **VEC_PMTRDT (new)** |
+| DIV | DIV_RS_DEPTH=4 | VEC_DIV (opLat=35, II=35) |
+| LSU | LSU_RS_DEPTH=4 | VecLSU |
+
+PMTRDT was removed in §11.22-§11.23 because gem5 had no scalar-vector overlap,
+so the 6-cycle non-pipelined unit caused 1.6-2.1x excess scalar stall cycles.
+With §11.25 (issue bypass) + §11.26 (commit bypass) that problem is now solved.
+
+### Change A — extend bypass commit to in-FU vector case (execute.cc)
+
+§11.26 only bypassed scalars when the head had `pendingFUDispatch = true`.
+Once the vector dispatches to its FU, scalars issued afterwards were still blocked
+at retirement while the vector flowed through the FU pipeline (up to 6 cycles for
+PMTRDT). This models incorrectly: the RTL ROB retires scalars independently via
+its own in-order commit path, not blocked by in-flight vectors.
+
+Fix: in the `isBubble()` branch of the FU check (vector not yet at FU output),
+run the same bypass scan when the head instruction is a non-memory vector:
+
+    if (fu_inst.inst->isBubble()) {
+        if (!inst->isFault() && inst->isInst() && inst->staticInst->isVector()) {
+            // same 8-position bypass scan as §11.26 pendingFUDispatch case
+            // sets is_bypass_commit, bypass_scan_idx, try_to_commit
+        }
+        if (!try_to_commit)
+            completed_inst = false;
+    }
+
+The `completed_inst = false` is now conditional — it only fires if no bypass was
+found, preventing it from overwriting a successful bypass's `completed_inst = true`.
+
+This covers the full RTL scalar-vector retirement decoupling:
+- Vector pending in vectorPendingQueue (pendingFUDispatch=true): §11.26
+- Vector dispatched but still executing in FU (isBubble at output): §11.27A
+
+### Change B — restore VEC_PMTRDT FU (configs/coralnpu/coralnpu_cpu.py)
+
+New factory `_make_CoralNPU_VEC_PMTRDT()`:
+
+    opLat   = 6      # 3 overhead + 3 EX (log2 tree, VLENB=16: 2+log2(16/8)=3 cy)
+    issueLat = 6     # non-pipelined: 1 op at a time in the unit
+    srcRelLat = [3,3] # v-to-v chain = 6-3 = 3 cy (same as ALU/MUL)
+
+Opcodes moved TO VEC_PMTRDT (from VEC_ALU/VEC_MUL):
+
+| OpClass | RTL unit | Instructions |
+|---|---|---|
+| SimdMisc | MISC | vmv.v.i/x/v, vmerge, viota, vid, vfirst, vmsbf/vmsif/vmsof, vcpop |
+| SimdExt | PMT | vslideup/down, vslide1up/down, vrgather, vcompress |
+| SimdFloatExt | PMT | vfslide1up/down, vfrgather |
+| SimdReduceAlu | RDT | vredand, vredor, vredxor, vredmin/u, vredmax/u |
+| SimdReduceCmp | RDT | vredminu, vredmaxu |
+| SimdReduceAdd | RDT | vredsum, vwredsum, vwredsumu |
+| SimdFloatReduceAdd | RDT | vfredosum, vfredusum, vfwredosum |
+| SimdFloatReduceCmp | RDT | vfredmin, vfredmax |
+
+Opcodes remaining in VEC_ALU (RTL CMP+ALU exe_unit):
+SimdAdd, SimdAlu, SimdCmp, SimdShift, SimdShiftAcc, SimdCvt, SimdConfig
+
+Opcodes remaining in VEC_MUL (RTL MUL+MAC exe_unit):
+SimdMult, SimdMultAcc, SimdAddAcc, SimdDotProd, SimdFloat{Add,Alu,Cmp,Cvt,Misc,Mult,MultAcc}
+
+One instance added to CoralNPU_FUPool (NUM_PMTRDT=1 in RTL).
+
+### vectorPendingQueue as PMTRDT RS
+
+The vectorPendingQueue (§11.25) models the 4-deep PMTRDT_RS.
+When VEC_PMTRDT FU is busy (issueLat=6), the next PMTRDT instruction defers
+to vectorPendingQueue and dispatches automatically when the FU becomes free.
+This correctly models RTL RS-based scheduling with no extra code.
+
+### Correctness: over-conservative for PMT/MISC
+
+RTL rvv_backend_pmtrdt.sv: "2-cycle for each uop" (PMT/MISC EX = 2 cy → total = 5 cy).
+Reduction takes 3 EX cycles (VLENB=16), so gem5 uses opLat=6 (worst case).
+PMT/MISC are 1 cycle over-conservative. Effect on scalar retirement: zero (bypass
+commit ensures scalars never block on the PMTRDT head). Effect on v-to-v chains
+through PMT/MISC: 1 extra cycle vs RTL (acceptable approximation).
+
+### Files changed
+
+- src/cpu/minor/execute.cc: extend bypass scan in isBubble() FU branch
+- configs/coralnpu/coralnpu_cpu.py: add VEC_PMTRDT, trim VEC_ALU/VEC_MUL opclasses
+
+---
+
+## §11.28 — Missing segmented vector memory opClasses in VecLSU (2026-06-10)
+
+### Problem
+
+RTL comparison audit revealed that five segmented vector memory opClasses existed in
+gem5's `src/cpu/op_class.hh` and were used by the RISC-V decoder for vlseg*/vsseg*/
+vlsseg*/vssseg* instructions, but were not listed in `_CoralNPU_VecLSU`.
+
+Missing opClasses (all in `op_class.hh` lines 130–138):
+- `SimdUnitStrideSegmentedLoad`              — vlseg2e8.v … vlseg8e64.v
+- `SimdUnitStrideSegmentedStore`             — vsseg2e8.v … vsseg8e64.v
+- `SimdUnitStrideSegmentedFaultOnlyFirstLoad`— vlseg\<n\>e\<eew\>ff.v
+- `SimdStrideSegmentedLoad`                  — vlsseg\<n\>e\<eew\>.v
+- `SimdStrideSegmentedStore`                 — vssseg\<n\>e\<eew\>.v
+
+Without these entries, any binary using segmented loads/stores would trigger gem5's
+startup warning "No functional unit for OpClass %s" and silently route those
+instructions through `noCostFU` at zero latency, bypassing the LSQ entirely —
+producing incorrect timing and no memory ordering.
+
+### Fix
+
+Added the five opClasses to the `_CoralNPU_VecLSU` MinorFU in
+`configs/coralnpu/coralnpu_cpu.py`. They share the same latency model as other
+vector unit-stride/strided loads:
+- opLat=1, issueLat=1, extraAssumedLat=4  → 5 cy total
+- Segmented accesses issue multiple sub-transactions (one per segment group per
+  element); gem5's LSQ issues one sub-tx per cycle, so the additional cycles
+  beyond the base 5 cy are incurred implicitly via LSQ back-pressure.
+
+### RTL basis
+
+CoralNPU RTL routes all vector memory operations (unit-stride, strided, indexed,
+segmented) through the same LSU pipeline (rvv_backend_lsu.sv). The DTCM latency
+model (3 cy overhead + ceil(vl×EEW_bytes/32)×2 cy) applies identically to
+segmented accesses; segmentation only adds more micro-transactions, not a different
+latency path. Using the same extraAssumedLat=4 for the base case is therefore correct.
+
+### Files changed
+
+- configs/coralnpu/coralnpu_cpu.py: add 5 segmented load/store opClasses to _CoralNPU_VecLSU

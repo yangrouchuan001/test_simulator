@@ -199,6 +199,10 @@ class MinorDynInst : public RefCounted
     /** This instruction is in the LSQ, not a functional unit */
     bool inLSQ = false;
 
+    /** Instruction has been accepted to the vector pending queue but not yet
+     *  dispatched to an FU. Models RTL scalar-vector decoupling (CQ/RS). */
+    bool pendingFUDispatch = false;
+
     /** Translation fault in case of a mem ref */
     Fault translationFault;
 
