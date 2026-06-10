@@ -556,6 +556,14 @@ Execute::issue(ThreadID thread_id)
      * the pending queue to free FUs. This models RTL RS-based OOO vector
      * execution where each FU dispatches independently when deps are ready. */
     {
+        /* §11.33: Per-FU scoreboard-blocked flag for this dispatch cycle.
+         * When item N fails canInstIssue for FU X, mark FU X blocked so
+         * no later item can dispatch to FU X this cycle.  This prevents
+         * out-of-order dispatch of microops that chain through the same FU
+         * but lack explicit register edges in the scoreboard (e.g. chained
+         * vredsum_vs_micro microops whose partial-sum chaining is implicit). */
+        std::vector<bool> fuScoreboardBlocked(numFuncUnits, false);
+
         auto it = thread.vectorPendingQueue.begin();
         while (it != thread.vectorPendingQueue.end()) {
             MinorDynInstPtr &pending_inst = *it;
@@ -585,10 +593,17 @@ Execute::issue(ThreadID thread_id)
                 const std::vector<bool> *cant_fwd =
                     &fu->cantForwardFromFUIndices;
 
+                /* §11.33: If an earlier item already failed canInstIssue for
+                 * this FU, skip — later items must not overtake it. */
+                if (fuScoreboardBlocked[pfu])
+                    continue;
+
                 if (!scoreboard[thread_id].canInstIssue(pending_inst,
                     src_lats, cant_fwd, cpu.curCycle(),
-                    cpu.getContext(thread_id)))
+                    cpu.getContext(thread_id))) {
+                    fuScoreboardBlocked[pfu] = true;
                     continue;
+                }
 
                 /* Can dispatch to this FU.
                  * Scoreboard was already marked at accept time (optimistic
