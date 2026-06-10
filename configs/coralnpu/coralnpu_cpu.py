@@ -297,9 +297,12 @@ def _make_CoralNPU_VEC_MUL():
 #   by 1 cy, but with bypass commit (§11.26/§11.27) scalar retirement is unaffected.
 #
 #   v-to-v chain: opLat(6) - srcRelLat(3) = 3 cy  (same as ALU/MUL).
-#   issueLat=6: non-pipelined, 1 instruction at a time through the unit.
-#     The vectorPendingQueue (§11.25) acts as the 4-deep RS: instructions
-#     queue there while the unit executes, dispatching when the FU is free.
+#
+#   issueLat=1: PIPELINED (§11.35). The RTL uses a handshake_ff pipeline
+#     (rvv_backend_pmtrdt_unit.sv): inready = ~outvalid | outready, which
+#     allows a new instruction into stage-0 every cycle regardless of whether
+#     the previous instruction has completed.  II=1, not II=6.
+#     The vectorPendingQueue (§11.25) still acts as the RS dispatch buffer.
 def _make_CoralNPU_VEC_PMTRDT():
     return MinorFU(
         opClasses=_make_op_class_set([
@@ -317,7 +320,7 @@ def _make_CoralNPU_VEC_PMTRDT():
             "SimdFloatReduceCmp",   # vfredmin, vfredmax
         ]),
         opLat=6,
-        issueLat=6,
+        issueLat=1,
         timings=[MinorFUTiming(
             description="CoralNPU_VEC_PMTRDT",
             srcRegsRelativeLats=[3, 3],  # v-to-v chain = 6-3 = 3cy (same as ALU/MUL)
@@ -383,7 +386,7 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     executeIssueLimit            = 4           (max 4 issues/cycle)
     executeMemoryIssueLimit      = 1           (1 LSU op/cycle)
     executeCommitLimit           = 4
-    executeInputBufferSize       = 16          (RTL CQ(8)+UQ(16) scalar-vector decoupling)
+    executeInputBufferSize       = 8           (RTL retirementBufferSize=8; §11.36)
     executeBranchDelay           = 2           (2-cycle branch flush; RTL: 2 fetch cycles)
     executeLSQTransfersQueueSize = 8           (LSU queue depth)
 
@@ -426,7 +429,7 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     executeMemoryIssueLimit = 1        # 1 LSU dispatch/cycle
     executeCommitLimit = 4
     executeMemoryCommitLimit = 1
-    executeInputBufferSize = 16        # RTL CQ(8)+UQ(16) decoupling depth; increased from 8
+    executeInputBufferSize = 8         # RTL retirementBufferSize=8 (scalar ROB); §11.36
 
     executeBranchDelay = 2           # RTL: 2 fetch cycles flushed on mispredict
     executeAllowEarlyMemoryIssue = False

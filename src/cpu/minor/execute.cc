@@ -572,6 +572,17 @@ Execute::issue(ThreadID thread_id)
 
         auto it = thread.vectorPendingQueue.begin();
         while (it != thread.vectorPendingQueue.end()) {
+            /* §11.36: Block all pending vector dispatch while vl/vtype is
+             * propagating from a vsetvl that issued this cycle.  Vector
+             * instructions read vl at their VRF-FF stage; issuing before
+             * vl stabilises would use the stale configuration. */
+            if (cpu.curCycle() <= thread.vlTypeDirtyUntil) {
+                DPRINTF(MinorExecute, "Pending vector dispatch stalled:"
+                    " vl/vtype dirty until after cycle %d\n",
+                    (unsigned)thread.vlTypeDirtyUntil);
+                break;
+            }
+
             MinorDynInstPtr &pending_inst = *it;
 
             /* Remove stale (wrong stream) or already-dispatched entries */
@@ -644,6 +655,17 @@ Execute::issue(ThreadID thread_id)
                 DPRINTF(MinorExecute,
                     "Dispatching pending vector inst: %s to FU %d\n",
                     *pending_inst, pfu);
+
+                /* §11.36: If the dispatched instruction is itself a
+                 * vsetvl/vsetivli (SimdConfig), mark vl/vtype dirty so
+                 * the next vector instruction waits 1 cycle. */
+                if (pending_inst->staticInst->opClass() == SimdConfigOp) {
+                    thread.vlTypeDirtyUntil = cpu.curCycle();
+                    DPRINTF(MinorExecute,
+                        "vsetvl dispatched from pending: vl dirty until"
+                        " after cycle %d\n",
+                        (unsigned)thread.vlTypeDirtyUntil);
+                }
 
                 dispatched = true;
                 it = thread.vectorPendingQueue.erase(it);
@@ -785,6 +807,17 @@ Execute::issue(ThreadID thread_id)
                     DPRINTF(MinorExecute,
                         "Can't issue as FU: %d is reserved by older pending"
                         " vector inst\n", fu_index);
+                } else if (!inst->isFault() &&
+                           inst->staticInst->isVector() &&
+                           cpu.curCycle() <= thread.vlTypeDirtyUntil) {
+                    /* §11.36: vl/vtype is propagating from a vsetvl that
+                     * issued this cycle; block vector instruction for 1 cycle.
+                     * The deferral check below will push it to
+                     * vectorPendingQueue so it retries next cycle. */
+                    DPRINTF(MinorExecute,
+                        "Can't issue vector inst: %s, vl/vtype dirty"
+                        " until after cycle %d\n",
+                        *inst, (unsigned)thread.vlTypeDirtyUntil);
                 } else {
                     MinorFUTiming *timing = (!inst->isFault() ?
                         fu->findTiming(inst->staticInst) : NULL);
@@ -910,6 +943,17 @@ Execute::issue(ThreadID thread_id)
                          *  it can be committed in order */
                         thread.inFlightInsts->push(fu_inst);
 
+                        /* §11.36: Track vsetvl/vsetivli issue so subsequent
+                         * vector instructions wait 1 cycle for the new
+                         * vl/vtype to propagate (RTL front-end delay). */
+                        if (inst->staticInst->opClass() == SimdConfigOp) {
+                            thread.vlTypeDirtyUntil = cpu.curCycle();
+                            DPRINTF(MinorExecute,
+                                "vsetvl issued: vl/vtype dirty until"
+                                " after cycle %d\n",
+                                (unsigned)thread.vlTypeDirtyUntil);
+                        }
+
                         issued = true;
                     }
                 }
@@ -941,9 +985,12 @@ Execute::issue(ThreadID thread_id)
                     any_capable_fu_exists = true;
                     /* §11.34: A FU reserved by an older pending item is not
                      * considered "free" — treat it like a busy FU so this
-                     * instruction gets deferred to vectorPendingQueue. */
+                     * instruction gets deferred to vectorPendingQueue.
+                     * §11.36: Similarly, when vl/vtype is dirty the FU is
+                     * not considered free for vector instructions. */
                     if (!f->alreadyPushed() && !f->stalled && f->canInsert() &&
-                        !fuReservedByPending[fi]) {
+                        !fuReservedByPending[fi] &&
+                        !(cpu.curCycle() <= thread.vlTypeDirtyUntil)) {
                         any_capable_fu_free = true;
                         break;
                     }

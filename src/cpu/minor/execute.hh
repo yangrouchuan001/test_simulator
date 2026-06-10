@@ -190,6 +190,12 @@ class Execute : public Named
          *  vector instructions queue in the reservation station (RS) / CQ. */
         std::deque<MinorDynInstPtr> vectorPendingQueue;
 
+        /** §11.36: Earliest cycle at which vl/vtype is valid after a
+         *  vsetvl/vsetivli.  Any vector instruction must wait until
+         *  cpu.curCycle() > vlTypeDirtyUntil before issuing/dispatching,
+         *  modelling the 1-cycle front-end vl propagation delay in RTL. */
+        Cycles vlTypeDirtyUntil = Cycles(0);
+
         /** The last commit was the end of a full instruction so an interrupt
          *  can safely happen */
         bool lastCommitWasEndOfMacroop;

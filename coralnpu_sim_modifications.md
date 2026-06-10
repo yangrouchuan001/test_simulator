@@ -70,6 +70,8 @@
     - 11.32 [CPI=222 — branch bypass-commit causes repeated stream changes (~98% misprediction rate)](#1132-cpi222--branch-bypass-commit-causes-repeated-stream-changes)
     - 11.33 [Permanent deadlock — vectorPendingQueue dispatches out-of-order microop, violating inFlightInsts ordering](#1133-permanent-deadlock--vectorpendingqueue-dispatches-out-of-order-microop)
     - 11.34 [Permanent deadlock — normal issue loop steals FU from older pending item that failed scoreboard check](#1134-permanent-deadlock--normal-issue-loop-steals-fu-from-older-pending-item-that-failed-scoreboard-check)
+    - 11.35 [CPI 5.06 → ~1.9x target — VEC\_PMTRDT modeled as non-pipelined (II=6) but RTL is pipelined (II=1)](#1135-cpi-506--target--vec_pmtrdt-modeled-as-non-pipelined-ii6-but-rtl-is-pipelined-ii1)
+    - 11.36 [gem5 12.7% faster than Verilator — missing vl/vtype dependency and oversized ROB](#1136-gem5-127-faster-than-verilator--missing-vlvtype-dependency-and-oversized-rob)
 
 ---
 
@@ -85,14 +87,14 @@
 | `src/dev/coralnpu/UartConsole.py` | **New** | gem5 Python param class for `UartConsole` |
 | `src/dev/coralnpu/SConscript` | **New** | Build registration for the UART device |
 | `configs/coralnpu/__init__.py` | **New** | Python package marker |
-| `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU; (§11.22) add `VEC_PMTRDT` non-pipelined FU (6 cy, reductions/slides/gather); `executeBranchDelay=2` (RTL: 2 fetch-flush cycles) |
+| `configs/coralnpu/coralnpu_cpu.py` | **New / Modified** | `CoralNPUMinorCPU` class — scalar + RVV FU pool; (§11.17) split LSU; (§11.22) add `VEC_PMTRDT` non-pipelined FU (6 cy, reductions/slides/gather); `executeBranchDelay=2` (RTL: 2 fetch-flush cycles); (§11.35) `VEC_PMTRDT` corrected to pipelined `issueLat=1` (RTL handshake_ff, II=1) |
 | `configs/coralnpu/coralnpu_se.py` | **New / Modified** | Simulation entry-point; adds `--uart-addr`, `UartConsole`, `system.cache_line_size=32`, `--profile`; (§11.20) atomic CPU ISA aligned with MinorCPU (`enable_rvv=True, vlen=128, elen=32`) |
 | `src/arch/riscv/isa/formats/vector_conf.isa` | **Modified** | Add `VSetVliDeclare` / `VSetVliBranchTarget` templates; extend `VConfOp` to call `branchTarget` for `vsetvli` |
 | `src/arch/riscv/tlb.cc` | **Modified** | (§11.13) Pass RV32-masked `vaddr` to `GenericPageTableFault`; (§11.16) SE translate path uses `pTable->lookup()` to read `Uncacheable` flag and sets `Request::UNCACHEABLE` so MMIO stores bypass the L1D cache |
 | `src/sim/mem_state.cc` | **Modified** | Add MMIO identity-map fallback in `fixupFault` so PIO device addresses (UART, etc.) are accessible from firmware; map created with `cacheable=false` so stores bypass L1D cache and reach the device immediately |
 | `src/dev/coralnpu/uart_console.cc` | **Modified** | Fix read handler to zero full packet buffer (`memset`) instead of overflowing 8-byte write; handles 32-byte L1I cache-line fills |
 | `src/arch/riscv/faults.cc` | **Modified** | `BreakpointFault::invokeSE`: replace `schedRelBreak(0)` with `exitSimLoop("ebreak", 0)` so bare-metal `ebreak` exits the simulation cleanly instead of killing the process via SIGTRAP |
-| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops; (§11.33) add `fuScoreboardBlocked` in pendingQueue dispatch loop to prevent out-of-order microop dispatch; (§11.34) add `fuReservedByPending` to prevent normal issue loop from stealing a FU that an older pending item is waiting for |
+| `src/cpu/minor/execute.cc` | **Modified** | `doInstCommitAccounting`: add `cpu.traceFunctions(inst->pc->instAddr())` so MinorCPU feeds PC crossings to the built-in function tracer (O3/Simple CPUs already called it; MinorCPU never did); (§11.25–§11.31) `vectorPendingQueue` OOO dispatch + bypass-commit with hazard checks; (§11.32) add `isControl()` break in both bypass scan loops; (§11.33) add `fuScoreboardBlocked` in pendingQueue dispatch loop to prevent out-of-order microop dispatch; (§11.34) add `fuReservedByPending` to prevent normal issue loop from stealing a FU that an older pending item is waiting for; (§11.36) add vl/vtype dirty stall — block vector issue/dispatch for 1 cycle after vsetvl |
 
 Timing customisation is done through gem5's Python configuration layer. The ISA extension (`mpause`) required one edit to `decoder.isa` (no new format file needed — it reuses the existing `SystemOp` format). The printf support required a minimal new C++ SimObject (`UartConsole`).
 
@@ -4074,3 +4076,146 @@ anyway and in practice use different FU indices.
 - `src/cpu/minor/execute.cc`: add `fuReservedByPending` vector; populate it
   after the `vectorPendingQueue` dispatch loop; add reservation check in the
   normal issue loop FU-scan and in the vector-deferral `any_capable_fu_free` test
+
+---
+
+## 11.35 CPI 5.06 → target — VEC\_PMTRDT modeled as non-pipelined (II=6) but RTL is pipelined (II=1)
+
+### Problem
+
+After §11.34, the simulation completed without deadlock but achieved **CPI = 5.06**
+(16,833,701 cycles / 3,325,302 instructions) vs Verilator's ~1.85 CPI (6,163,833 cycles).
+The simulation statistics showed:
+
+| FU 14 (VEC_PMTRDT) op class | Issued ops |
+|---|---|
+| SimdExt (vslide*, vsext, vrgather) | 655,364 |
+| SimdReduceAdd (vredsum) | 1,048,576 |
+| SimdMisc (vcpyvs, vpinvd, vmv, etc.) | 876,594 |
+| **Total** | **2,580,534** |
+
+With `issueLat=6` (non-pipelined), FU 14 required a minimum of
+2,580,534 × 6 = **15,483,204 cycles** — 92% of the total 16,833,701 cycle simulation.
+This meant FU 14 was perpetually the critical path and everything else waited for it.
+
+The Verilator achieves 6,163,833 cycles for the same workload. If PMTRDT were truly
+non-pipelined at II=6 with 2.58M operations, it would need at minimum 15.48M cycles —
+**more than double** the Verilator total. This is a mathematical contradiction.
+
+### Root cause
+
+The gem5 FU model had `issueLat=6` for `VEC_PMTRDT`, meaning it treated the unit as
+non-pipelined (only one instruction in-flight at a time). The assumption came from the
+RTL comment "2-cycle for each uop" in `rvv_backend_pmtrdt.sv`, which was interpreted
+as a pipeline stall.
+
+RTL analysis (`rvv_backend_pmtrdt_unit.sv`, `handshake_ff.sv`) revealed the actual
+pipeline behaviour:
+
+```
+// handshake_ff.sv line 36:
+assign inready = ~outvalid | outready;
+```
+
+This means stage-0 asserts `inready = 1` (can accept a new instruction) whenever:
+- the stage is empty (`~outvalid`), OR
+- the downstream stage has already consumed the current result (`outready`)
+
+Both conditions allow the NEXT instruction to enter stage-0 on the VERY NEXT CYCLE
+while the PREVIOUS instruction is still traversing later stages. **The unit is pipelined
+with II = 1.** The opLat = 6 (3 fixed overhead + 3 EX for reduction at VLEN=128) is
+correct; only the issueLat was wrong.
+
+### Fix
+
+Change `issueLat` in `_make_CoralNPU_VEC_PMTRDT()` in
+`configs/coralnpu/coralnpu_cpu.py`:
+
+```python
+# Before (§11.22):
+opLat=6,
+issueLat=6,
+
+# After (§11.35):
+opLat=6,
+issueLat=1,   # RTL: handshake_ff pipeline, II=1
+```
+
+`srcRegsRelativeLats=[3, 3]` is unchanged; the v-to-v chain penalty = 6-3 = 3 cycles
+remains correct (same ROB-result bypass applies).
+
+**Expected impact:** FU 14 minimum occupancy drops from 15.48M cycles to 2.58M cycles
+(–12.9M cycles, –77%). The simulation CPI should converge toward the Verilator
+reference of ~1.85.
+
+### Files changed
+
+- `configs/coralnpu/coralnpu_cpu.py`: `_make_CoralNPU_VEC_PMTRDT()` — `issueLat=6` → `issueLat=1`
+
+---
+
+## 11.36 gem5 12.7% faster than Verilator — missing vl/vtype dependency and oversized ROB
+
+### Problem
+
+After §11.35 the CPI was 1.618 (5,379,306 cycles) vs Verilator 1.853 (6,163,833 cycles).
+gem5 was 12.7% faster than RTL. RTL analysis identified two causes:
+
+1. **`executeInputBufferSize = 16` vs RTL `retirementBufferSize = 8`**: gem5 could hold twice
+   as many instructions in-flight as the RTL scalar ROB, giving artificial ILP.
+
+2. **Missing vl/vtype implicit dependency**: every RVV instruction implicitly reads `vl`
+   and `vtype` written by `vsetvl`/`vsetivli`. In the RTL, `vsetvl` executes in the scalar
+   front-end and writes the new `vl`/`vtype` at the end of the decode cycle. Any vector
+   instruction that decodes in the SAME cycle must stall 1 cycle for the new config to
+   propagate to the VRF-FF stage. gem5 did not model this dependency — vector instructions
+   issued immediately after `vsetvl` with no stall, making gem5 artificially fast.
+   With ~990K `vsetvl` instructions each immediately followed by a vector instruction,
+   the missing stall amounted to approximately 784K–990K cycles.
+
+### Fix
+
+**Fix A — ROB size** (`configs/coralnpu/coralnpu_cpu.py`):
+```python
+# Before:
+executeInputBufferSize = 16
+# After (§11.36):
+executeInputBufferSize = 8    # RTL retirementBufferSize=8
+```
+
+**Fix B — vl/vtype dependency** (`src/cpu/minor/execute.hh` + `execute.cc`):
+
+Add `Cycles vlTypeDirtyUntil` to `ExecuteThreadInfo`. When a `SimdConfig` instruction
+(vsetvl/vsetivli) successfully issues or is dispatched from `vectorPendingQueue`, set:
+```cpp
+thread.vlTypeDirtyUntil = cpu.curCycle();
+```
+
+In three enforcement points, block vector instructions when `cpu.curCycle() <= vlTypeDirtyUntil`:
+
+1. **`vectorPendingQueue` dispatch loop** — break the dispatch loop for this cycle, preventing
+   pending vector instructions from dispatching in the same cycle as a `vsetvl`.
+
+2. **Normal issue loop FU scan** — new `else if` branch after `§11.34 fuReservedByPending`
+   check; prevents a vector instruction from issuing to an otherwise-free FU in the same
+   cycle as `vsetvl`.
+
+3. **Deferral `any_capable_fu_free` check** — adds `!(cpu.curCycle() <= vlTypeDirtyUntil)`
+   to the free-FU predicate so that a dirty vl/vtype causes the vector instruction to be
+   deferred to `vectorPendingQueue` (retries next cycle when vl is clean).
+
+**Timing model:**
+- `vsetvl` issues at cycle N → `vlTypeDirtyUntil = N`
+- Vector instruction check: `curCycle (N) <= N` → blocked (same cycle)
+- Vector instruction check: `curCycle (N+1) > N` → allowed (1 cycle later)
+- This models exactly 1 stall cycle when a vector instruction immediately follows a `vsetvl`.
+
+### Files changed
+
+- `configs/coralnpu/coralnpu_cpu.py`: `executeInputBufferSize` 16 → 8
+- `src/cpu/minor/execute.hh`: add `Cycles vlTypeDirtyUntil` to `ExecuteThreadInfo`
+- `src/cpu/minor/execute.cc`:
+  - `vectorPendingQueue` dispatch loop: break when vl dirty; set dirty on SimdConfig dispatch
+  - Normal issue loop FU scan: new `§11.36` else-if blocking vector issue when vl dirty
+  - After successful issue: set `vlTypeDirtyUntil` when SimdConfig issues
+  - Deferral `any_capable_fu_free`: add vl dirty guard
