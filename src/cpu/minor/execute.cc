@@ -1465,6 +1465,50 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                 if (!(fu_inst.inst->id == cand->id))
                                     continue;
                             }
+                            /* WAR hazard check: don't bypass cand if it
+                             * writes any source register of any instruction
+                             * ahead of it in inFlightInsts (positions 0 to
+                             * scan_idx-1). Those instructions commit after
+                             * cand in a bypass but they came earlier in
+                             * program order and must read the pre-write
+                             * value. Committing cand first would leave them
+                             * reading cand's new (post-write) register value
+                             * at execute time → functional incorrectness. */
+                            {
+                                bool war_hazard = false;
+                                if (cand->isInst()) {
+                                    auto *isa =
+                                        cpu.getContext(thread_id)->getIsaPtr();
+                                    for (unsigned int chk = 0;
+                                         chk < scan_idx && !war_hazard; chk++)
+                                    {
+                                        QueuedInst *prev =
+                                            ex_info.inFlightInsts->peekAt(chk);
+                                        if (!prev) break;
+                                        MinorDynInstPtr pi = prev->inst;
+                                        if (pi->isBubble() || pi->isFault()
+                                            || !pi->isInst()) continue;
+                                        int ns = pi->staticInst->numSrcRegs();
+                                        int nd =
+                                            cand->staticInst->numDestRegs();
+                                        for (int si = 0;
+                                             si < ns && !war_hazard; si++) {
+                                            RegId src =
+                                                pi->staticInst->srcRegIdx(si)
+                                                .flatten(*isa);
+                                            for (int di = 0;
+                                                 di < nd && !war_hazard; di++) {
+                                                if (src ==
+                                                    cand->staticInst
+                                                    ->destRegIdx(di)
+                                                    .flatten(*isa))
+                                                    war_hazard = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (war_hazard) continue;
+                            }
                             DPRINTF(MinorExecute, "Bypass committing"
                                 " scalar inst %s past pending vector"
                                 " head\n", *cand);
@@ -1517,6 +1561,53 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                                     if (cand_fu.inst->isBubble()) continue;
                                     if (!(cand_fu.inst->id == cand->id))
                                         continue;
+                                }
+                                /* WAR hazard check (same as §11.26 path):
+                                 * don't bypass cand if it writes a register
+                                 * that any instruction at positions 0..
+                                 * scan_idx-1 reads as a source.  Those
+                                 * instructions commit later (after this
+                                 * bypass) but are earlier in program order
+                                 * and must see the pre-write value. */
+                                {
+                                    bool war_hazard = false;
+                                    if (cand->isInst()) {
+                                        auto *isa =
+                                            cpu.getContext(thread_id)
+                                            ->getIsaPtr();
+                                        for (unsigned int chk = 0;
+                                             chk < scan_idx && !war_hazard;
+                                             chk++)
+                                        {
+                                            QueuedInst *prev =
+                                                ex_info.inFlightInsts
+                                                ->peekAt(chk);
+                                            if (!prev) break;
+                                            MinorDynInstPtr pi = prev->inst;
+                                            if (pi->isBubble() || pi->isFault()
+                                                || !pi->isInst()) continue;
+                                            int ns =
+                                                pi->staticInst->numSrcRegs();
+                                            int nd =
+                                                cand->staticInst->numDestRegs();
+                                            for (int si = 0;
+                                                 si < ns && !war_hazard; si++) {
+                                                RegId src =
+                                                    pi->staticInst->srcRegIdx(si)
+                                                    .flatten(*isa);
+                                                for (int di = 0;
+                                                     di < nd && !war_hazard;
+                                                     di++) {
+                                                    if (src ==
+                                                        cand->staticInst
+                                                        ->destRegIdx(di)
+                                                        .flatten(*isa))
+                                                        war_hazard = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (war_hazard) continue;
                                 }
                                 DPRINTF(MinorExecute, "Bypass committing"
                                     " scalar inst %s past in-FU vector"

@@ -3556,3 +3556,90 @@ vector instruction is pending dispatch, the CPU must keep ticking so that
 ### Files changed
 
 - src/cpu/minor/execute.cc: guard fuIndex out-of-bounds in evaluate() activity check
+
+---
+
+## §11.30 — Simulation infinite loop: WAR hazard in bypass commit causes wrong computation (2026-06-10)
+
+### Symptom
+
+Simulation ran indefinitely (CPI ≈ 674, killed after 212 s host time with only
+169 K instructions committed). The binary never reached its exit point.
+
+### Root cause
+
+A **write-after-read (WAR) hazard** between the bypass commit path (§11.26/§11.27)
+and the vectorPendingQueue (§11.25) caused instructions to read incorrect register
+values, producing wrong computation results → wrong branch conditions → infinite loop.
+
+**Mechanism:**
+
+1. Vector instruction V is deferred to `vectorPendingQueue` (`pendingFUDispatch=true`).
+   The issue loop continues and issues scalar S1 (next in program order) in the same
+   cycle. S1 writes integer register R1, which V reads as a source (e.g., vsetvl's
+   rs1, vle.v's base address).
+
+2. S1's `markupInstDests` sets `returnCycle[R1] = curCycle + S1_lat`. The scoreboard
+   now blocks V's dispatch from the vectorPendingQueue (WAR stall).
+
+3. Bypass commit (§11.26) fires: S1 is at its FU output, V is at head with
+   `pendingFUDispatch=true`. S1 passes all bypass filters (scalar, not memref, not
+   vector, FU ready). S1 is bypass-committed: **S1 writes R1's new value to the
+   register file** and clears S1's scoreboard entry.
+
+4. S1's scoreboard clear unblocks V's dispatch. V dispatches to its FU.
+
+5. V eventually commits (reads R1 at `commitInst` time). R1 now contains S1's
+   **post-write** value, but V is earlier in program order and should see the
+   **pre-write** value. **Wrong computation.**
+
+6. Wrong computation propagates to a branch condition → infinite loop.
+
+This affects any vector instruction with an integer scalar source (vsetvl/vsetvli,
+vector loads/stores reading a base address, vmv.v.x reading a scalar src, etc.).
+The binary's 208 vsetvl instructions and 120 vector loads made this extremely common.
+
+### Why it happens
+
+In gem5's MinorCPU, register values are read **at commit time** (when
+`commitInst()` calls `staticInst->execute()`), not at issue time. In-order commit
+guarantees that V reads R1 before S1 writes it (V is earlier in `inFlightInsts`).
+Bypass commit breaks this guarantee by committing S1 before V, so V reads S1's
+new R1 value.
+
+### Fix
+
+Added a **WAR hazard check** in both bypass scan paths (§11.26 and §11.27A).
+Before committing bypass candidate `cand` at position `scan_idx`, we check
+whether `cand` writes any source register of any instruction at positions
+0..scan_idx−1 in `inFlightInsts`. If a match is found, `cand` is skipped.
+
+```
+for each position chk = 0 .. scan_idx-1:
+    pi = inFlightInsts[chk]
+    if any src_reg of pi == any dest_reg of cand:
+        WAR hazard → continue (skip cand)
+```
+
+This check catches all cases:
+- `chk=0` (the head vector): prevents bypassing a scalar that writes the head
+  vector's integer source registers (vsetvl base, load base, etc.)
+- `chk=1..scan_idx-1` (intermediate instructions): prevents bypassing a scalar
+  whose write would corrupt any earlier-in-program-order instruction that hasn't
+  committed yet
+
+Complexity: O(scan_idx × srcRegs × destRegs) ≈ O(8 × 6 × 2) = O(96) comparisons
+per bypass candidate — negligible vs simulation overhead.
+
+### RTL basis
+
+In the CoralNPU RTL, the out-of-order vector retirement path maintains correct
+write-before-read ordering via the ROB's register dependency tracking. Scalars
+in the CQ can only retire when their register values are architecturally correct.
+A scalar that writes a vector instruction's source register cannot retire until
+after the vector instruction has consumed that source. The WAR check in the bypass
+path models this constraint.
+
+### Files changed
+
+- src/cpu/minor/execute.cc: add WAR hazard check in both bypass scan locations
