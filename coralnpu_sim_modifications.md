@@ -3504,3 +3504,55 @@ latency path. Using the same extraAssumedLat=4 for the base case is therefore co
 ### Files changed
 
 - configs/coralnpu/coralnpu_cpu.py: add 5 segmented load/store opClasses to _CoralNPU_VecLSU
+
+---
+
+## §11.29 — Segfault on first vector instruction: OOB fuIndex in evaluate() (2026-06-10)
+
+### Root cause
+
+`Execute::evaluate()` contains an activity-check loop (lines ~1875–1890 in the
+modified execute.cc) that tests whether the head of `inFlightInsts` might commit:
+
+```cpp
+if (head_inst.inst->isNoCostInst()) {
+    head_inst_might_commit = true;
+} else {
+    FUPipeline *fu = funcUnits[head_inst.inst->fuIndex];   // ← CRASH
+    ...
+}
+```
+
+The `isNoCostInst()` guard was the only check before dereferencing
+`funcUnits[fuIndex]`.  When §11.25 added the `pendingFUDispatch` path, deferred
+vector instructions are pushed into `inFlightInsts` with
+`fuIndex = noCostFUIndex = numFuncUnits + 1` (a sentinel that is intentionally
+**outside** the valid `funcUnits` array range).
+
+`isNoCostInst()` returns false for a real vector instruction, so execution fell
+through to `funcUnits[numFuncUnits + 1]` — an out-of-bounds array access →
+**SIGSEGV on the first vector instruction dispatched to vectorPendingQueue**.
+
+### Fix
+
+Added `fuIndex == noCostFUIndex` to the guard, handling both noCostInst and
+pendingFUDispatch uniformly:
+
+```cpp
+if (head_inst.inst->isNoCostInst() ||
+    head_inst.inst->fuIndex == noCostFUIndex)
+{
+    head_inst_might_commit = true;   // keep CPU active for dispatch
+} else {
+    FUPipeline *fu = funcUnits[head_inst.inst->fuIndex];
+    ...
+}
+```
+
+Setting `head_inst_might_commit = true` is also correct for liveness: when a
+vector instruction is pending dispatch, the CPU must keep ticking so that
+`issue()` can run `vectorPendingQueue` dispatch on the next cycle.
+
+### Files changed
+
+- src/cpu/minor/execute.cc: guard fuIndex out-of-bounds in evaluate() activity check

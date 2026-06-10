@@ -1876,7 +1876,12 @@ Execute::evaluate()
         if (!info.inFlightInsts->empty()) {
             const QueuedInst &head_inst = info.inFlightInsts->front();
 
-            if (head_inst.inst->isNoCostInst()) {
+            if (head_inst.inst->isNoCostInst() ||
+                head_inst.inst->fuIndex == noCostFUIndex)
+            {
+                /* Either a no-cost inst or a pending-dispatch vector inst
+                 * (fuIndex == noCostFUIndex sentinel).  Keep ticking so
+                 * issue() can dispatch the vectorPendingQueue entry. */
                 head_inst_might_commit = true;
             } else {
                 FUPipeline *fu = funcUnits[head_inst.inst->fuIndex];
