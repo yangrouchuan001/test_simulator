@@ -65,6 +65,7 @@
 #   coralnpu_sim_modifications.md  (change log and usage)
 
 from m5.objects import (
+    BTFNBP,
     BranchPredictor,
     LocalBP,
     MinorFU,
@@ -539,9 +540,10 @@ class CoralNPUMinorCPU(RiscvMinorCPU):
     executeFuncUnits = CoralNPU_FUPool
 
     # ── Branch predictor ──────────────────────────────────────────────────────
+    # §11.40: Use BTFN static predictor to match RTL Fetch.scala PredecodeDe:
+    #   backward conditional branches predicted taken, forward not-taken.
+    #   LocalBP learns correct predictions (better than RTL), underestimating
+    #   misprediction stalls; BTFNBP matches RTL's static behaviour.
     branchPred = BranchPredictor(
-        conditionalBranchPred=LocalBP(
-            localPredictorSize=256,
-            localCtrBits=2,
-        )
+        conditionalBranchPred=BTFNBP()
     )

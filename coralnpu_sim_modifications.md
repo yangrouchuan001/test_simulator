@@ -4590,3 +4590,258 @@ consumer), not `[1, 1]`. With `extraAssumedLat=1`:
 changed from `[1, 1]` → `[0, 0]`.
 
 Estimated additional impact (dequant FPU→FPU chains): +1 cy per FPU-dependent-FPU dispatch.
+
+---
+
+## 11.39 gem5 simulation results after §11.38 — cycle counts and gap analysis
+
+**Date**: 2026-06-11
+**gem5 cycles (post-§11.38)**: 4,578,487
+**Verilator cycles**: 6,342,989
+**Remaining gap**: 1,764,502 cycles (27.8% error, down from 30.6% post-§11.37)
+**Improvement from §11.38**: +175,292 cycles (gap narrowed from 1,939,794 → 1,764,502)
+
+### Observed vs. estimated impact
+
+| Expected | Observed | Delta |
+|---------|---------|-------|
+| ~314K (ALU→LSU, 1 stall/iter × 313K iters) | +175K | −139K |
+| ~some (FPU→FPU +1 cy) | included in 175K | — |
+
+The fix applied ~56% of the expected impact. The discrepancy stems from:
+
+1. **Loop structure**: `IntMult = 313,909` confirms 313,909 inner MAC iterations, but `MemRead / IntMult ≈ 2.8` suggests the loop may be unrolled or the address increment (`addi s2`) is dispatched much earlier in the iteration — not on the critical `addi→lb` dependency path in every iteration.
+
+2. **Critical path absorption**: If `addi s2` dispatches early in the iteration (before the `mul→add` chain completes), its +1 cycle result latency is hidden behind the longer `load→mul→add` critical path (6 cycles), and the ALU→LSU stall is absorbed.
+
+3. **FPU→FPU improvement** partially offset any overcount elsewhere.
+
+### Instruction mix (from sim stats)
+
+| OpClass | Issued | % |
+|---------|--------|---|
+| IntAlu | 2,408,753 | 59.1% |
+| IntMult | 313,909 | 7.7% |
+| MemRead | 882,398 | 21.7% |
+| FloatMisc | 61,687 | 1.5% |
+| FloatCvt | 49,307 | 1.2% |
+| FloatCmp | 24,643 | 0.6% |
+| SimdMisc | 93,141 | 2.3% |
+| SimdConfig | 18,072 | 0.4% |
+
+### Branch mispredictions — potential large discrepancy source
+
+`mispredicted::DirectCond = 97,463` at 20.9% misprediction rate. With `executeBranchDelay=2`:
+- gem5 penalty: 97,463 × 2 ≈ **195K extra cycles**
+
+In the RTL, `Fetch.scala:PredecodeDe` predicts JAL, backward conditional branches (`op(31)==1, bxx, not-taken pattern excluded`), and `ret` via RAS. The RTL predictor differs from gem5's `LocalBP`. If RTL has lower misprediction rate on the same branches, the Verilator cycle count would be HIGHER than gem5 for those branches — consistent with the direction of the gap.
+
+This warrants investigation: if the RTL branch predictor has a HIGHER misprediction rate than gem5's LocalBP (e.g., on outer loop exit branches that are predicted-taken in RTL but not-taken in reality), RTL spends more cycles on flushes.
+
+### Remaining gap attribution (post-§11.38 estimate)
+
+| Source | Estimated cycles |
+|--------|----------------|
+| `forceSlot0Only()` for FPU/CSR (dispatch width constraint) | ~unknown |
+| Branch misprediction model mismatch | ~unknown |
+| Write-port 4 contention (MLU/FPU/RVV arbiter) | ~small |
+| Loop structure / other unmodelled hazards | ~1.35M |
+| **Total remaining gap** | **1,764,502** |
+
+---
+
+## 11.40 Static branch predictor — BTFN to match RTL Fetch.scala PredecodeDe
+
+**Date**: 2026-06-11
+**Root cause**: gem5 uses `LocalBP` (2-bit saturating counter, 256-entry), which learns
+correct predictions over time. The RTL uses a **static** predictor (`Fetch.scala:PredecodeDe`):
+all backward conditional branches predicted taken, all forward not-taken. For frequently-taken
+forward branches (outer loop exits, dequant thresholds), the RTL always mispredicts while
+`LocalBP` eventually predicts correctly. This understates gem5 cycle count vs. Verilator.
+
+### RTL evidence — `Fetch.scala`
+
+```scala
+// PredecodeDe stage: predict taken for backward conditionals
+val bxx = op === BitPat("b???????_?????_?????_???_?????_1100011") &&
+            op(31) && op(14,13) =/= 1.U   // backward bxx → predict taken
+val ret = ...
+val bTaken = bxx || ret || jal
+```
+
+`op(31)` is bit 31 of the instruction word = sign bit of the B-type immediate.
+For RISC-V B-type encoding, a negative offset (backward branch) sets bit 31.
+Prediction: `op(31)==1` AND `bxx` AND `op(14,13)≠1` → predict taken; else not-taken.
+
+### gem5 implementation — `BTFNBP` class
+
+New `ConditionalPredictor` subclass implementing the RTL's static behaviour.
+
+**Design challenge**: `ConditionalPredictor::lookup(tid, pc, bp_history)` does not receive
+the instruction encoding. Direction must be inferred differently from the RTL.
+
+**Solution**: direction cache populated from commit-time `update` calls (where the
+resolved target address IS available). Only taken-branch updates are stored, so
+loop-exit not-taken resolutions (target = PC+4 > PC) do not corrupt backward-branch entries.
+
+```
+lookup(pc):
+    if pc in dirCache: return dirCache[pc]   # true=backward=taken
+    return false                              # default not-taken (forward branch assumption)
+
+update(pc, taken, target):
+    if squashed: return
+    if taken: dirCache[pc] = (target < pc)   # only update on taken; target=real branch dest
+```
+
+Cold start behaviour:
+- First encounter of any branch: predict not-taken (one misprediction if backward)
+  RTL: predict taken immediately from encoding (no cold start)
+  Impact: negligible for 313K-iteration inner loops (≤1 extra mispredict per loop invocation)
+- After first taken resolution: direction cached; subsequent predictions match RTL exactly
+
+For forward branches that are always taken: both gem5 (BTFNBP) and RTL mispredict every time.
+For backward branches (loops): both predict taken; loop-exit misprediction occurs in both.
+
+### Files modified / created
+
+| File | Change |
+|------|--------|
+| `src/cpu/pred/btfn.hh` | New: BTFNBP class declaration |
+| `src/cpu/pred/btfn.cc` | New: BTFNBP implementation |
+| `src/cpu/pred/BranchPredictor.py` | Added `BTFNBP` SimObject class |
+| `src/cpu/pred/SConscript` | Added `BTFNBP` to SimObjects list and `btfn.cc` to Source |
+| `configs/coralnpu/coralnpu_cpu.py` | `conditionalBranchPred=BTFNBP()` (was `LocalBP`) |
+
+### Expected impact
+
+With `executeBranchDelay=2` and `mispredictDueToPredictor_0::DirectCond=96,893` (LocalBP):
+- LocalBP predicts most forward-taken branches correctly after warmup
+- BTFNBP will mispredict ALL forward-taken branches (like RTL)
+- Expected additional mispredictions ≈ number of forward-taken branches currently correct
+
+From `sim_stats.txt` (post-§11.38): `mispredicted_0::DirectCond=97,463` total.
+Proportion correctly-predicted-but-RTL-wrong (forward taken) estimated ~40-60% of the gap
+between LocalBP-correct and RTL-mispredicted forward branches.
+
+Estimated cycle increase: **~50K–190K** cycles (wide range; depends on forward-taken count).
+
+
+---
+
+## 11.41 RVV Command Queue depth: 16→8 (§11.41)
+
+**Date**: 2026-06-11
+**Root cause**: gem5 `vectorPendingQueueSize = 16` but RTL `CQ_DEPTH = 8`
+(`coralnpu/hdl/verilog/rvv/inc/rvv_backend_define.svh`).
+
+The vector pending queue in gem5 Execute models how many vector instructions can be
+dispatched and in-flight in the RVV coprocessor before the scalar pipeline stalls
+waiting for slots to free up. With the wrong depth (16 vs 8), gem5 allows twice as many
+vector instructions to pipeline without back-pressuring scalar dispatch.
+
+### RTL evidence
+```
+// rvv_backend_define.svh
+`define CQ_DEPTH  8   // Command Queue depth
+`define LCQ_DEPTH 8   // Legal Command Queue
+`define ROB_DEPTH 8   // RVV internal ROB
+```
+
+The `remaining_count_cq2rvs` signal (used to feed back CQ occupancy to the scalar
+dispatch unit) is computed as `CQ_DEPTH - used_count_cq`, clamped to 0 when trapping.
+
+### Fix
+```cpp
+// src/cpu/minor/execute.hh
+// Before: vectorPendingQueueSize = 16
+static constexpr unsigned int vectorPendingQueueSize = 8;
+```
+
+### Expected impact
+Impact depends on burst density of vector instructions. For workloads where vector
+instructions cluster (e.g., a phase of consecutive vector ops), the scalar pipeline
+stalls 8 instructions earlier in RTL than gem5. With `SimdMisc=93,141` vector
+instructions in the workload, estimate **~5K–50K cycles** depending on clustering.
+
+---
+
+## 11.42 `forceSlot0Only()` dispatch serialization — unmodeled structural hazard
+
+**Date**: 2026-06-11
+**Root cause**: RTL `Decode.scala` restricts all scalar float, CSR, and fence instructions
+to dispatch from lane 0 only, with NO other instruction dispatched in the same cycle.
+gem5 MinorCPU has no equivalent mechanism.
+
+### RTL evidence — `Decode.scala` lines 165–169, 399–406
+
+```scala
+def forceSlot0Only(): Bool = {
+  isFency() || isCsr() || isFloat() || rvvReadsFloatRs1() || rvvWritesFrd()
+}
+
+val slot0Interlock = (0 until p.instructionLanes).map(i =>
+  if (i == 0) true.B
+  else !decodedInsts(0).forceSlot0Only() && !decodedInsts(i).forceSlot0Only()
+)
+```
+
+The bilateral check blocks ALL lanes 1..N-1 whenever lane 0 (or any earlier lane) carries
+a `forceSlot0Only` instruction. Combined with the in-order `lastReady` chain (lines 526–731),
+the instruction following a float op must wait one extra dispatch cycle even if it has no
+data dependency.
+
+### gem5 gap
+`IsNonSpeculative` flag (set on CSR instructions) is silently ignored in MinorCPU.
+The `issueLimit=4` counter is a global per-cycle budget — issuing `[fmul, add, add, add]`
+in one cycle is legal in gem5. No mechanism exists in MinorCPU to model "this instruction
+must occupy all dispatch slots."
+
+### Affected instruction classes and instruction count (from post-§11.38 sim_stats)
+| Class | gem5 issued | forceSlot0Only |
+|-------|-------------|---------------|
+| FloatMisc (fmul.s, etc.) | 61,687 | ✓ |
+| FloatCvt (fcvt.*) | 49,307 | ✓ |
+| FloatCmp (flt.s, fle.s) | 24,643 | ✓ |
+| **Total scalar FP** | **135,637** | ✓ |
+
+### Estimated impact
+Per forceSlot0Only dispatch: RTL wastes up to `instructionLanes - 1 = 3` co-issue slots.
+Assuming on average 1–2 ALU instructions would have been co-issued:
+- RTL extra dispatch cycles ≈ 135,637 × 1.5 ≈ **~200K cycles**
+- gem5: 0 extra cycles
+
+### Modeling options
+1. **Not modeled** — document as known structural hazard. ~200K of the remaining gap.
+2. **Approximation**: wrap all FPU FU definitions inside a serializing "barrier" FU that
+   all FP instructions must acquire (opLat=0, issueLat=1) AND that ALU FUs also need.
+   MinorCPU's FU model does not support this natively; would require C++ changes.
+3. **Add `extraAssumedLat=+1` to all FPU FUs** — this penalizes the FPU output timing but
+   does NOT correctly model the dispatch stall for *surrounding* ALU instructions.
+   Rough approximation only.
+
+**Current status**: unmodeled. Represents approximately ~200K cycles of the remaining gap.
+
+---
+
+## 11.43 Fetch pipeline and vsetvl dispatch — confirmed correct
+
+**Date**: 2026-06-11
+
+### Fetch pipeline (confirmed)
+- L0 I-cache: 1024 bytes, 32 cache lines × 32 bytes/line, direct-mapped
+- Fetch bandwidth: 4 instructions/cycle matching `issueLimit=4` ✓
+- Inner loop (280 iter × ~8 insn body ≈ 2240 bytes) fits in L0 ✓
+- Correctly-predicted taken branch (inner loop back-edge): 1-cycle fill, both RTL and gem5 ✓
+- BRU misprediction penalty: 2 cycles in RTL; `executeBranchDelay=2` in gem5 ✓
+- No fetch-related discrepancy found.
+
+### vsetvl dispatch path (confirmed correct)
+- vsetvl/vsetivli dispatch via `io.rvv` (RVV dispatch port), NOT `io.csr`
+- The CSR ROB-empty requirement (`!decodedInsts(i).isCsr() || io.retirement_buffer_empty`)
+  does NOT apply to vsetvl — `isCsr()` covers only `csrrw/csrrs/csrrc` (SYSTEM opcode 0x73)
+- gem5 routes vsetvl through `CoralNPU_CSR` FU (SimdConfig op class) — correct timing
+  since gem5's CSR FU also has no ROB-empty constraint ✓
+- Post-vsetvl RVV load/store interlock: `rvvConfigInterlock` in Decode.scala holds RVV
+  LSU dispatch until `configState` propagates from the RVV core. gem5 models this via
+  `vlTypeDirtyUntil` (1-cycle front-end delay). Approximately correct.

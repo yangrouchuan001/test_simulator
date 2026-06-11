@@ -1166,3 +1166,13 @@ class GshareBP(BranchPredictor):
 
     global_predictor_size = Param.Unsigned(512, "Size of global predictor")
     global_counter_bits = Param.Unsigned(2, "Bits per counter")
+
+
+class BTFNBP(ConditionalPredictor):
+    """Backward-Taken Forward-Not-Taken static predictor.
+    Models CoralNPU RTL Fetch.scala PredecodeDe: backward conditional
+    branches predicted taken, forward predicted not-taken.
+    Direction is inferred from the resolved target of taken branches."""
+    type = "BTFNBP"
+    cxx_class = "gem5::branch_prediction::BTFNBP"
+    cxx_header = "cpu/pred/btfn.hh"

@@ -120,8 +120,8 @@ class Execute : public Named
     unsigned int noCostFUIndex;
 
     /** Maximum depth of the per-thread vector pending queue. Models the
-     *  RTL's combined CQ+UQ in-flight vector instruction capacity (16). */
-    static constexpr unsigned int vectorPendingQueueSize = 16;
+     *  RTL CQ_DEPTH=8 (rvv_backend_define.svh). Was 16; corrected §11.41. */
+    static constexpr unsigned int vectorPendingQueueSize = 8;
 
     /** Dcache port to pass on to the CPU.  Execute owns this */
     LSQ lsq;
