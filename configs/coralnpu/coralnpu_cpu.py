@@ -16,9 +16,9 @@
 #     ALU  × 4   latency=1  II=1  extLat=1  srcRelLat=[1]  (comb consumer; regd +1 offset)
 #     MLU  × 1   latency=3  II=1  extLat=1  srcRelLat=[1,1]
 #     DVU  × 1   latency=34 II=34 extLat=1  srcRelLat=[1,1]
-#     FPU_FF × 1  latency=3  II=1  extLat=1  srcRelLat=[1,1]
-#     FPU_FI × 1  latency=5  II=1  extLat=1  srcRelLat=[1,1]
-#     FDV    × 1  latency=14 II=14 extLat=1  srcRelLat=[1,1]
+#     FPU_FF × 1  latency=3  II=1  extLat=1  srcRelLat=[0,0]  (regd consumer; FRegfile no comb)
+#     FPU_FI × 1  latency=5  II=1  extLat=1  srcRelLat=[0,0]  (regd consumer; float src)
+#     FDV    × 1  latency=14 II=14 extLat=1  srcRelLat=[0,0]  (regd consumer; float src)
 #     ScalarLSU × 1  latency=1  extraAssumedLat=3  srcRelLat=[0]  (regd consumer)
 #     VecLSU    × 1  latency=1  extraAssumedLat=4  (5cy total; RTL: 3ovhd+2EX)
 #     CSR  × 1   latency=1  extLat=1  srcRelLat=[1]  serialising
@@ -54,8 +54,8 @@
 #   Scalar-vector decoupling (§11.25-§11.27):
 #     Scalar instructions bypass stalled/pending vector ops at BOTH issue and
 #     retirement, matching RTL CQ/UQ/ROB decoupled scalar-vector retirement.
-#     The vectorPendingQueue acts as the PMTRDT RS (depth 4 → modelled by
-#     vectorPendingQueueSize=16 which also covers ALU/MUL RS).
+#     The vectorPendingQueue models the RTL CQ (depth 8, §11.41).
+#     execute.hh: vectorPendingQueueSize=8 (was 16, corrected §11.41).
 #
 # References:
 #   coralnpu/doc/microarch/microarch.md

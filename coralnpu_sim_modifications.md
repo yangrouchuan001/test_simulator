@@ -4845,3 +4845,120 @@ Assuming on average 1–2 ALU instructions would have been co-issued:
 - Post-vsetvl RVV load/store interlock: `rvvConfigInterlock` in Decode.scala holds RVV
   LSU dispatch until `configState` propagates from the RVV core. gem5 models this via
   `vlTypeDirtyUntil` (1-cycle front-end delay). Approximately correct.
+
+---
+
+## 11.44 Instruction mix analysis — 5% vs 28% RTL/gem5 gap comparison
+
+**Date**: 2026-06-11
+
+### Files compared
+| File | RTL/gem5 gap | Hot kernel |
+|------|-------------|-----------|
+| `test_module_conv_1_1_new2_fix_problem` | **5%** | `main_dispatch_0_reduction_4096x1024_i8xi8xi32` |
+| `test_module` (conv_28x40x7x10x4) | **28%** | `only_conv_fixed$async_dispatch_0_conv_28x40x7x10x4_i8xi8xi32` |
+
+### Key finding: scalar float in the hot path is the gap driver
+
+**5% binary**: The hot kernel uses vectorized MAC (`vwmul.vv + vredsum.vs`) and integer
+quantization (`mulh + srai`). **Zero scalar float instructions in the hot path.**
+No `forceSlot0Only` serialization occurs. gem5 and RTL agree well.
+
+**28% binary**: The hot kernel has two phases:
+1. Scalar int8 MAC: 7-instruction inner loop (`lb+lb+mul+add+addi+addi+bne`), ~549K iters.
+2. Scalar float normalization block: **~213K dynamic float instructions** executed across
+   1,120 output pixels (190 float ops × 1,120 calls).
+   Float ops: `fmul.s`, `fdiv.s`, `fadd.s`, `fsub.s`, `flt.s`, `fcvt.s.w`, `fcvt.wu.s`.
+
+### Dynamic float instruction count (28% binary)
+| Category | Static | Dynamic (×1,120 calls) |
+|----------|--------|----------------------|
+| fmul.s / fdiv.s | 18 | ~20,160 |
+| fcvt.s.w / fcvt.wu.s | ~9 | ~10,080 |
+| fadd.s / fsub.s / flt.s etc. | ~163 | ~182,560 |
+| **Total scalar float** | **190** | **~213K** |
+
+### Impact
+Each scalar float instruction triggers `forceSlot0Only` in RTL, wasting up to 3 dispatch
+slots per float dispatch. gem5 (before §11.42 fix) co-issues float+ALU freely.
+Estimated RTL penalty: ~213K × 1.5 avg_slots_wasted ≈ **~320K extra RTL cycles**.
+
+**Conclusion**: Fix §11.42 (`forceSlot0Only` in gem5) is confirmed as the primary remaining
+discrepancy. Implementing it should close the 28%-gap workload from ~1.76M toward the 5%
+level seen in the pure-integer/RVV benchmark.
+
+---
+
+## 11.45 `forceSlot0Only()` dispatch serialization implemented in gem5 (§11.42 fix)
+
+**Date**: 2026-06-11
+**Root cause**: Confirmed by §11.44 analysis. RTL `Decode.scala` forces all scalar float
+(`isFloat()`), CSR (`isCsr()`), and fence/privileged (`isFency()`) instructions to dispatch
+from lane 0 alone — no co-issue with any other instruction in the same cycle. gem5 previously
+co-issued float+ALU freely since `IsNonSpeculative` is ignored by MinorCPU.
+
+### Implementation — `src/cpu/minor/execute.cc`
+
+Three changes to the `Execute::issue()` function:
+
+**1. New local variable** (after `num_mem_insts_issued` declaration):
+```cpp
+/* §11.42: set when a float/CSR instruction is issued this cycle;
+ * prevents any further co-issue (RTL Decode.scala:165-169). */
+bool issued_force_slot0_only = false;
+```
+
+**2. Pre-issue guard** (inside the `else` branch, before the inner FU-finding loop):
+```cpp
+/* §11.42: forceSlot0Only — float/CSR must dispatch alone (slot 0).
+ * If other instructions have already been issued this cycle, defer
+ * this instruction to next cycle (leave inputIndex unchanged). */
+if (num_insts_issued > 0 && !inst->isFault() &&
+    (inst->staticInst->isFloating() ||
+     inst->staticInst->isNonSpeculative()))
+{
+    issued = false;  // exits outer loop; inputIndex not advanced
+    break;
+}
+```
+
+**3. Post-issue set + outer loop condition**:
+```cpp
+// After num_insts_issued++:
+if (inst->staticInst->isFloating() ||
+    inst->staticInst->isNonSpeculative()) {
+    issued_force_slot0_only = true;
+}
+```
+```cpp
+// do-while condition extended with:
+&& !issued_force_slot0_only  // §11.42: no co-issue after float/CSR
+```
+
+### Mapping to RTL
+| RTL condition (`forceSlot0Only()`) | gem5 check |
+|-----------------------------------|-----------|
+| `isFloat()` — all scalar FP | `staticInst->isFloating()` |
+| `isCsr()` — csrrw/csrrs/csrrc | `staticInst->isNonSpeculative()` |
+| `isFency()` — fencei/ebreak/wfi | `staticInst->isNonSpeculative()` |
+| `rvvReadsFloatRs1()` / `rvvWritesFrd()` | covered by `isFloating()` on associated scalar ops |
+
+### Expected impact
+~213K dynamic float dispatches in `conv_28x40x7x10x4`, each now properly serialized.
+Estimated cycle increase: **~150K–300K cycles** (gap narrows from 1.76M toward ~1.46M–1.6M).
+
+---
+
+## 11.46 Header comment corrections in coralnpu_cpu.py
+
+**Date**: 2026-06-11
+
+Two stale comments corrected in the file header:
+
+**FPU srcRegsRelativeLats**: Updated from `[1,1]` → `[0,0]` to match the §11.38 fix
+(FRegfile.scala has no comb scoreboard, so FPU_FF/FPU_FI/FDV are regd consumers).
+
+**vectorPendingQueueSize**: Updated comment from `=16` → `=8` to match the §11.41 fix
+(RTL `CQ_DEPTH = 8` per `rvv_backend_define.svh`).
+
+Neither change affects simulation behavior (comments only).

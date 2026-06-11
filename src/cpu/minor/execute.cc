@@ -708,6 +708,10 @@ Execute::issue(ThreadID thread_id)
     /* Number of memory ops issues this cycle to check for memoryIssueLimit */
     unsigned num_mem_insts_issued = 0;
 
+    /* §11.42: forceSlot0Only — set when a float/CSR instruction is issued
+     * this cycle; prevents any further co-issue (RTL Decode.scala:165-169). */
+    bool issued_force_slot0_only = false;
+
     do {
         MinorDynInstPtr inst = insts_in->insts[thread.inputIndex];
         Fault fault = inst->fault;
@@ -732,6 +736,21 @@ Execute::issue(ThreadID thread_id)
             issued = true;
             discarded = true;
         } else {
+            /* §11.42: forceSlot0Only — float and non-speculative (CSR/fence)
+             * instructions must dispatch alone (slot 0 only) in the RTL.
+             * If other instructions have already been issued this cycle, stop
+             * here and let this instruction be the first next cycle. */
+            if (num_insts_issued > 0 && !inst->isFault() &&
+                (inst->staticInst->isFloating() ||
+                 inst->staticInst->isNonSpeculative()))
+            {
+                DPRINTF(MinorExecute, "Deferring forceSlot0Only inst: %s"
+                    " to next cycle (already issued %d this cycle)\n",
+                    *inst, num_insts_issued);
+                issued = false;  /* exits outer loop; inputIndex not advanced */
+                break;
+            }
+
             /* Try and issue an instruction into an FU, assume we didn't and
              * fix that in the loop */
             issued = false;
@@ -1056,6 +1075,13 @@ Execute::issue(ThreadID thread_id)
             if (!discarded && !inst->isBubble()) {
                 num_insts_issued++;
 
+                /* §11.42: forceSlot0Only — after issuing a float or
+                 * non-speculative instruction, block all further co-issue. */
+                if (inst->staticInst->isFloating() ||
+                    inst->staticInst->isNonSpeculative()) {
+                    issued_force_slot0_only = true;
+                }
+
                 if (num_insts_issued == issueLimit)
                     DPRINTF(MinorExecute, "Reached inst issue limit\n");
             }
@@ -1082,7 +1108,8 @@ Execute::issue(ThreadID thread_id)
         fu_index != numFuncUnits && /* Not visited all FUs */
         issued && /* We've not yet failed to issue an instruction */
         num_insts_issued != issueLimit && /* Still allowed to issue */
-        num_mem_insts_issued != memoryIssueLimit);
+        num_mem_insts_issued != memoryIssueLimit &&
+        !issued_force_slot0_only); /* §11.42: no co-issue after float/CSR */
 
     return num_insts_issued;
 }
