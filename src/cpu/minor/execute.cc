@@ -1088,7 +1088,7 @@ Execute::issue(ThreadID thread_id)
 
                 /* §11.49: branchInterlock — after a conditional branch,
                  * block all further co-issue this cycle. */
-                if (inst->staticInst->isCondControl()) {
+                if (inst->staticInst->isCondCtrl()) {
                     issued_cond_branch = true;
                 }
 
