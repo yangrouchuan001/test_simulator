@@ -4442,3 +4442,151 @@ instruction overhead, and additional load-use stalls in non-MAC code sections.
   - `_CoralNPU_ScalarLSU`: `extraAssumedLat=1` → `extraAssumedLat=2`
   - `_CoralNPU_FPU` replaced by `_CoralNPU_FPU_FF` (opLat=3), `_CoralNPU_FPU_FI` (opLat=5), `_CoralNPU_FDV` (opLat=14, issueLat=14)
   - `CoralNPU_FUPool`: updated to reference the three new FU objects
+
+---
+
+## 11.38 Dual-scoreboard regd vs comb — ALU→LSU requires +1 cycle (conv_28x40x7x10x4_i8xi8xi32)
+
+**Date**: 2026-06-11
+**Target workload**: `conv_28x40x7x10x4_i8xi8xi32`
+**Baseline**: post-§11.37 state (gem5=4,403,195, Verilator=6,342,989; gap ~1.94M)
+**Finding source**: `Regfile.scala`, `Decode.scala` RTL inspection
+
+### Root cause
+
+`Regfile.scala` maintains TWO scoreboards for the scalar integer register file:
+
+```scala
+// scoreboard_clr is computed combinatorially from writeData.valid
+val scoreboard_clr = Cat(scoreboard_clr0(31,1), 0.U(1.W))
+when (scoreboard_set =/= 0.U || scoreboard_clr =/= 0.U) {
+    val nxtScoreboard = (scoreboard & ~scoreboard_clr) | scoreboard_set
+    scoreboard := Cat(nxtScoreboard(31,1), 0.U(1.W))
+}
+io.scoreboard.regd := scoreboard                   // REGISTERED: clears NEXT cycle
+io.scoreboard.comb := scoreboard & ~scoreboard_clr // COMBINATORIAL: clears SAME cycle
+```
+
+`Decode.scala` chooses which scoreboard to use per source register:
+
+```scala
+val usesRs1Regd = decodedInsts.map(d => d.jalr || d.isLsu())
+val usesRs2Regd = decodedInsts.map(d => d.isScalarStore())
+val readAfterWrite = (readScoreboardRegd & regd) =/= 0.U || (readScoreboardComb & comb) =/= 0.U
+```
+
+- **Loads/stores (rs1 = base address)** → `regd`: clears one cycle AFTER write
+- **Scalar stores (rs2 = data)** → `regd`: clears one cycle AFTER write
+- **All other instructions** → `comb`: clears SAME cycle as write
+
+### Effect on inner MAC loop
+
+Inner loop skeleton (conv kernel, per-iteration):
+```
+T=0:  addi s2, s2, 1     (ALU: writes s2 at T+1)
+T=1:  lb   a6, 0(s2)     (LSU: needs s2 via regd → must wait until T+2)
+```
+
+| Model | scoreboard used | lb a6 dispatches | iteration period |
+|-------|----------------|-----------------|-----------------|
+| Verilator | regd | T+2 | 9 cycles |
+| gem5 before §11.38 | (ignored — same as comb) | T+1 | 8 cycles |
+| gem5 after §11.38 | regd modelled | T+2 | 9 cycles |
+
+Per-iteration difference: 1 cycle × ~314K inner MAC iterations ≈ **314K cycles**.
+
+### gem5 model limitation
+
+`Cycles` is `uint64_t` (`unsigned=True, size=64`), so `srcRegsRelativeLats=[-1]` is rejected
+by `param_types.py:_check()` (`min=0`). Cannot use the unsigned-overflow trick directly.
+
+**Solution (Option B)**: encode the regd offset in the PRODUCER via `extraAssumedLat=+1` and
+cancel it for `comb` consumers via `srcRegsRelativeLats=[1, …]`.
+
+For producer dispatched at cycle T:
+- `returnCycle = T + opLat + extraAssumedLat`
+- **Before**: `extraAssumedLat=0` → `returnCycle = T + opLat`
+- **After**: `extraAssumedLat=1` → `returnCycle = T + opLat + 1`
+
+For `canInstIssue`: consumer issues when `returnCycle ≤ now + srcRelLat`.
+
+| Consumer type | srcRegsRelativeLats | Effective latency (after ALU opLat=1) |
+|--------------|---------------------|---------------------------------------|
+| comb (ALU, MLU, FPU, …) | [1, …] | `T+2 ≤ now+1` → now ≥ T+1 → **1 cy** ✓ |
+| regd (ScalarLSU, VecLSU) | [0] | `T+2 ≤ now+0` → now ≥ T+2 → **2 cy** ✓ |
+
+### Verification chain
+
+| Dependency | RTL behaviour | gem5 before | gem5 after |
+|------------|--------------|-------------|-----------|
+| ALU→ALU | comb at T+1 | T+1 ✓ | T+1 ✓ (srcRelLat=1 cancels +1) |
+| ALU→ScalarLSU | regd at T+2 | T+1 ✗ | T+2 ✓ |
+| MLU→ALU | comb at T+3 | T+3 ✓ | T+3 ✓ |
+| MLU→ScalarLSU | regd at T+4 | T+3 ✗ | T+4 ✓ |
+| ScalarLSU→ALU | comb at T+3 | T+3 ✓ | T+3 ✓ |
+| ScalarLSU→ScalarLSU | regd at T+4 | T+3 ✗ | T+4 ✓ |
+
+### Files changed
+
+`configs/coralnpu/coralnpu_cpu.py`:
+
+```python
+# All scalar producers: add extraAssumedLat=1
+# All comb consumers: srcRegsRelativeLats [0,...] → [1,...]
+# regd consumers (ScalarLSU, VecLSU): srcRegsRelativeLats stays [0]
+
+# ALU (was: srcRelLat=[0], no extraAssumedLat)
+timings=[MinorFUTiming(
+    description="CoralNPU_ALU",
+    srcRegsRelativeLats=[1],   # comb consumer
+    extraAssumedLat=1,         # regd +1 offset
+)]
+
+# MLU (was: srcRelLat=[0,0], no extraAssumedLat)
+timings=[MinorFUTiming(
+    description="CoralNPU_MLU",
+    srcRegsRelativeLats=[1, 1],
+    extraAssumedLat=1,
+)]
+
+# DVU, FPU_FF, FPU_FI, FDV, CSR: same pattern — srcRelLat [0...] → [1...]  +  extraAssumedLat=1
+
+# ScalarLSU (was: srcRelLat=[0], extraAssumedLat=2)
+timings=[MinorFUTiming(
+    description="CoralNPU_ScalarLSU",
+    srcRegsRelativeLats=[0],   # regd consumer: +1 already in producer's extraAssumedLat
+    extraAssumedLat=3,         # 1+3=4cy for regd consumers; comb see T+3 via srcRelLat=[1]
+)]
+```
+
+### Estimated impact
+
+~314K cycles (1 cycle × ~314K inner MAC iterations). Remaining gap post-§11.38 ≈ 1.63M cycles.
+
+### Units NOT changed
+
+- `_CoralNPU_VecLSU`: writes to **vector** register file (separate scoreboard); VecLSU as consumer already corrected by producer `extraAssumedLat=+1`.
+- `_make_CoralNPU_VEC_ALU/MUL/PMTRDT/_CoralNPU_VEC_DIV`: vector units; v-to-v latency calibrated independently via `srcRegsRelativeLats=[2,2]`.
+
+### Addendum: FRegfile.scala — float scoreboard is regd-only
+
+`FRegfile.scala` (read 2026-06-11) exposes only a single registered scoreboard:
+
+```scala
+scoreboard := (scoreboard & ~scoreboard_clr) | io.scoreboard_set  // registered
+io.scoreboard := scoreboard                                         // no comb output
+```
+
+Unlike the integer `Regfile.scala` which has both `regd` and `comb`, the float register file
+has no same-cycle forwarding path. All FPU instructions that read float source registers are
+therefore `regd` consumers.
+
+**Impact**: `FPU_FF`, `FPU_FI`, and `FDV` must use `srcRegsRelativeLats=[0, 0]` (regd
+consumer), not `[1, 1]`. With `extraAssumedLat=1`:
+- FPU→FPU chain: returnCycle=T+4, consumer issues at T+4 → **4 cycles** (was 3, incorrect).
+- RTL: float scoreboard clears at T+4 → float consumer dispatches at T+4 ✓.
+
+**Correction**: `_CoralNPU_FPU_FF`, `_CoralNPU_FPU_FI`, `_CoralNPU_FDV` `srcRegsRelativeLats`
+changed from `[1, 1]` → `[0, 0]`.
+
+Estimated additional impact (dequant FPU→FPU chains): +1 cy per FPU-dependent-FPU dispatch.

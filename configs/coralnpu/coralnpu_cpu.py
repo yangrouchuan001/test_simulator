@@ -13,15 +13,24 @@
 #   Branch penalty : 2 cycles (2 fetch cycles flushed on misprediction)
 #
 #   Scalar FUs:
-#     ALU  × 4   latency=1  II=1  (one per dispatch lane)
-#     MLU  × 1   latency=3  II=1  (pipelined shared multiplier)
-#     DVU  × 1   latency=34 II=34 (non-pipelined divider, lane-0 only in HW)
-#     FPU_FF × 1  latency=3  II=1  (float→float: fadd,fmul,fsgnj,fabs; FPNEW 3cy)
-#     FPU_FI × 1  latency=5  II=1  (float→int: flt,fle,fcvt; FPNEW 3cy + Queue 2cy)
-#     FDV    × 1  latency=14 II=14 (fdiv/fsqrt; non-pipelined FPNEW TH32)
-#     ScalarLSU × 1  latency=1  extraAssumedLat=2  (3cy total; no LSU bypass in RTL)
+#     ALU  × 4   latency=1  II=1  extLat=1  srcRelLat=[1]  (comb consumer; regd +1 offset)
+#     MLU  × 1   latency=3  II=1  extLat=1  srcRelLat=[1,1]
+#     DVU  × 1   latency=34 II=34 extLat=1  srcRelLat=[1,1]
+#     FPU_FF × 1  latency=3  II=1  extLat=1  srcRelLat=[1,1]
+#     FPU_FI × 1  latency=5  II=1  extLat=1  srcRelLat=[1,1]
+#     FDV    × 1  latency=14 II=14 extLat=1  srcRelLat=[1,1]
+#     ScalarLSU × 1  latency=1  extraAssumedLat=3  srcRelLat=[0]  (regd consumer)
 #     VecLSU    × 1  latency=1  extraAssumedLat=4  (5cy total; RTL: 3ovhd+2EX)
-#     CSR  × 1   latency=1  serialising
+#     CSR  × 1   latency=1  extLat=1  srcRelLat=[1]  serialising
+#
+#   Dual-scoreboard model (§11.38):
+#     RTL Regfile.scala (integer): regd clears 1cy AFTER write; comb SAME cycle.
+#       Loads/JALR use regd; integer ALU/MLU/etc use comb.
+#     RTL FRegfile.scala (float): ONLY regd scoreboard (no comb).
+#     All scalar producers carry extraAssumedLat=+1 so returnCycle = opLat+1+issue.
+#     Integer comb consumers (ALU,MLU,DVU,CSR): srcRegsRelativeLats=[1] → net = opLat.
+#     Integer regd consumers (ScalarLSU, VecLSU): srcRegsRelativeLats=[0] → net = opLat+1.
+#     Float regd consumers (FPU_FF,FPU_FI,FDV): srcRegsRelativeLats=[0] → net = opLat+1.
 #
 # RVV co-processor (Level-2 approximate timing)
 # ──────────────────────────────────────────────
@@ -93,7 +102,11 @@ def _make_CoralNPU_ALU():
         opClasses=_make_op_class_set(["IntAlu"]),
         opLat=1,
         issueLat=1,
-        timings=[MinorFUTiming(description="CoralNPU_ALU", srcRegsRelativeLats=[0])],
+        timings=[MinorFUTiming(
+            description="CoralNPU_ALU",
+            srcRegsRelativeLats=[1],  # comb consumer: +1 cancels regd-offset in returnCycle
+            extraAssumedLat=1,        # regd clears 1 cy after write; models RTL dual-scoreboard
+        )],
     )
 
 # MLU — 1 shared pipelined multiplier (arbitrated across lanes).
@@ -103,7 +116,11 @@ _CoralNPU_MLU = MinorFU(
     opClasses=_make_op_class_set(["IntMult"]),
     opLat=3,
     issueLat=1,
-    timings=[MinorFUTiming(description="CoralNPU_MLU", srcRegsRelativeLats=[0, 0])],
+    timings=[MinorFUTiming(
+        description="CoralNPU_MLU",
+        srcRegsRelativeLats=[1, 1],   # comb consumer
+        extraAssumedLat=1,            # regd +1 offset
+    )],
 )
 
 # DVU — 1 non-pipelined divider (lane 0 only in HW).
@@ -113,7 +130,11 @@ _CoralNPU_DVU = MinorFU(
     opClasses=_make_op_class_set(["IntDiv"]),
     opLat=34,
     issueLat=34,
-    timings=[MinorFUTiming(description="CoralNPU_DVU", srcRegsRelativeLats=[0, 0])],
+    timings=[MinorFUTiming(
+        description="CoralNPU_DVU",
+        srcRegsRelativeLats=[1, 1],   # comb consumer
+        extraAssumedLat=1,            # regd +1 offset
+    )],
 )
 
 # FPU — 1 pipelined floating-point unit (slot 0 only in HW).
@@ -144,7 +165,11 @@ _CoralNPU_FPU_FF = MinorFU(
     ]),
     opLat=3,
     issueLat=1,
-    timings=[MinorFUTiming(description="CoralNPU_FPU_FF", srcRegsRelativeLats=[0, 0])],
+    timings=[MinorFUTiming(
+        description="CoralNPU_FPU_FF",
+        srcRegsRelativeLats=[0, 0],   # regd consumer: FRegfile has no comb scoreboard
+        extraAssumedLat=1,            # float regd clears 1cy after write (FRegfile.scala:41-42)
+    )],
 )
 
 # Float → int: flt, fle, feq (comparisons → scalar rd), fcvt (conversions → scalar rd)
@@ -156,7 +181,11 @@ _CoralNPU_FPU_FI = MinorFU(
     ]),
     opLat=5,
     issueLat=1,
-    timings=[MinorFUTiming(description="CoralNPU_FPU_FI", srcRegsRelativeLats=[0, 0])],
+    timings=[MinorFUTiming(
+        description="CoralNPU_FPU_FI",
+        srcRegsRelativeLats=[0, 0],   # regd consumer: float sources use FRegfile regd scoreboard
+        extraAssumedLat=1,            # FPU_FI writes integer rd: integer regd clears T+opLat+1
+    )],
 )
 
 # Float divide / sqrt — non-pipelined FPNEW MERGED DIVSQRT unit.
@@ -169,7 +198,11 @@ _CoralNPU_FDV = MinorFU(
     ]),
     opLat=14,
     issueLat=14,
-    timings=[MinorFUTiming(description="CoralNPU_FDV", srcRegsRelativeLats=[0, 0])],
+    timings=[MinorFUTiming(
+        description="CoralNPU_FDV",
+        srcRegsRelativeLats=[0, 0],   # regd consumer: float sources use FRegfile regd scoreboard
+        extraAssumedLat=1,            # float regd +1 offset
+    )],
 )
 
 # CSR / System — serialising instructions (csrrw/csrrs/csrrc/fence/wfi/…).
@@ -177,7 +210,11 @@ _CoralNPU_CSR = MinorFU(
     opClasses=_make_op_class_set(["System"]),
     opLat=1,
     issueLat=1,
-    timings=[MinorFUTiming(description="CoralNPU_CSR", srcRegsRelativeLats=[0])],
+    timings=[MinorFUTiming(
+        description="CoralNPU_CSR",
+        srcRegsRelativeLats=[1],      # comb consumer
+        extraAssumedLat=1,            # regd +1 offset
+    )],
 )
 
 
@@ -187,8 +224,8 @@ _CoralNPU_CSR = MinorFU(
 #
 # RTL latency (pipeline_and_instructions.md):
 #
-#   Scalar DTCM load:  3 cy effective (E1: addr; E2: SRAM; no LSU bypass → +1 stall)
-#     → opLat=1 + extraAssumedLat=2 = 3 cy total
+#   Scalar DTCM load:  3 cy for comb consumers (ALU), 4 cy for regd consumers (LSU)
+#     → opLat=1 + extraAssumedLat=3  (§11.38 dual-scoreboard model)
 #
 #   Vector DTCM load:  3 cy overhead (DE2-FF + ROB-FF + VRF-FF)
 #                    + ceil(vl × EEW_bytes / 32) × (1 + memory_cycles)
@@ -200,18 +237,19 @@ _CoralNPU_CSR = MinorFU(
 # independent FU pool slots; having two separate entries lets the
 # scoreboard apply the correct latency to each class.
 
-# Scalar LSU — 3-cycle effective load-to-use latency.
+# Scalar LSU — 3-cycle effective load-to-use latency for comb consumers;
+# 4-cycle for regd consumers (e.g. a load whose result feeds an LSU base address).
 #
-# RTL (Decode.scala): the LSU write port (lsuOffset = instructionLanes+1) does
-# NOT participate in the regfile's same-cycle write-forwarding path.  A load
-# result is written to the regfile at the end of the SRAM access cycle (T+2)
-# but a dependent consumer cannot read the new value until the following cycle
-# (T+3) and therefore dispatches one cycle later than gem5's old 2-cy model.
+# RTL (Decode.scala §11.38): LSU rs1 reads regfile via regd (clears 1cy after write).
+# All scalar producers carry extraAssumedLat=+1 (§11.38 dual-scoreboard offset).
+# ScalarLSU as consumer: srcRegsRelativeLats=[0] so ALU→LSU stall is 2cy (T+2).
+# ScalarLSU as producer: extraAssumedLat=3 → returnCycle=T+4 for regd consumers,
+#   T+3 for comb consumers (via srcRegsRelativeLats=[1] on consumer side).
 #
 #   E1 addr calc  : T+1
-#   E2 SRAM       : T+2  (data written to regfile at T+2, no bypass)
-#   consumer reads: T+3  → consumer executes at T+3
-#   gem5 model    : opLat=1 + extraAssumedLat=2 = 3 cy total
+#   E2 SRAM       : T+2
+#   E3 writeback  : T+3  (comb clears T+3; regd clears T+4)
+#   gem5 model    : opLat=1 + extraAssumedLat=3; comb consumers issue at T+3 ✓
 _CoralNPU_ScalarLSU = MinorFU(
     opClasses=_make_op_class_set([
         "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
@@ -220,8 +258,8 @@ _CoralNPU_ScalarLSU = MinorFU(
     issueLat=1,
     timings=[MinorFUTiming(
         description="CoralNPU_ScalarLSU",
-        srcRegsRelativeLats=[0],
-        extraAssumedLat=2,    # 1+2 = 3 cy total  (RTL: no LSU bypass, regfile WB required)
+        srcRegsRelativeLats=[0],      # regd consumer: +1 already in producer's extraAssumedLat
+        extraAssumedLat=3,            # 1+3=4cy for regd consumers; comb consumers see T+3 via [1]
     )],
 )
 
