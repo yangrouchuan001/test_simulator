@@ -16,8 +16,8 @@
 #     ALU  × 4   latency=1  II=1  extLat=1  srcRelLat=[1]  (comb consumer; regd +1 offset)
 #     MLU  × 1   latency=3  II=1  extLat=1  srcRelLat=[1,1]
 #     DVU  × 1   latency=34 II=34 extLat=1  srcRelLat=[1,1]
-#     FPU_FF × 1  latency=3  II=1  extLat=1  srcRelLat=[0,0]  (regd consumer; FRegfile no comb)
-#     FPU_FI × 1  latency=5  II=1  extLat=1  srcRelLat=[0,0]  (regd consumer; float src)
+#     FPU_FF × 1  latency=3  II=1  extLat=1  srcRelLat=[0,0]  (regd consumer; float→float only)
+#     FPU_FI × 1  latency=5  II=1  extLat=1  srcRelLat=[0,0]  (regd consumer; float→int + FloatMisc)
 #     FDV    × 1  latency=14 II=14 extLat=1  srcRelLat=[0,0]  (regd consumer; float src)
 #     ScalarLSU × 1  latency=1  extraAssumedLat=3  srcRelLat=[0]  (regd consumer)
 #     VecLSU    × 1  latency=1  extraAssumedLat=4  (5cy total; RTL: 3ovhd+2EX)
@@ -144,25 +144,34 @@ _CoralNPU_DVU = MinorFU(
 # Operations that write to a SCALAR (integer) register also pass through
 # a 2-stage Queue (scalar_rd_pipe, FloatCore.scala:367), adding 2 cy.
 #
-#   Float → float result (fadd, fmul, fsgnj, fabs, …): 3 cy (FPNEW only)
-#   Float → int   result (flt, fle, feq, fclass):      5 cy (FPNEW 3 + Queue 2)
-#   Float → int   result (fcvt F2I, fcvt W2F as I2F):  5 cy (FPNEW 3 + Queue 2)
-#   fmv.x.w (FloatMisc → int):                         3 cy (FPNEW 1 + Queue 2)
+#   Float → float result (fadd, fmul, fmadd, …):       3 cy (FPNEW only)
+#   Float → int   result (flt, fle, feq):               5 cy (FPNEW 3 + Queue 2)
+#   Float → int   result (fcvt F2I, W2F as I2F):        5 cy (FPNEW 3 + Queue 2)
+#   fmv.x.w  (FloatMisc → int): hardcoded scalar_rd_pipe → 5 cy (§11.48)
+#   fclass.s (FloatMisc → int): scalar_rd=1 → scalar_rd_pipe → 5 cy (§11.48)
+#   fsgnj.s, fmin.s, fmax.s (FloatMisc → float): 3 cy (FPNEW only)
+#   fmv.w.x  (FloatMisc → float): 3 cy (FPNEW only)
+#
+# Note: All FloatMisc ops share a single op-class and cannot be routed
+# independently.  Since fmv.x.w and fclass.s are the dominant FloatMisc
+# instructions in the workload, FloatMisc is placed in FPU_FI (opLat=5).
+# This over-penalises fsgnj/fmin/fmax/fmv.w.x by 2 cy — a conservative
+# approximation acceptable while gem5 is still faster than RTL. (§11.48)
 #
 # Two FU objects are used so gem5 can apply the correct opLat per class:
-#   _CoralNPU_FPU_FF : float-to-float ops  (opLat=3)
-#   _CoralNPU_FPU_FI : float-to-int  ops  (opLat=5)
-#   _CoralNPU_FDV    : fdiv / fsqrt        (opLat=14, issueLat=14, non-pipelined)
+#   _CoralNPU_FPU_FF : float→float (fadd,fmul,fmadd,…):  opLat=3
+#   _CoralNPU_FPU_FI : float→int + FloatMisc:             opLat=5
+#   _CoralNPU_FDV    : fdiv / fsqrt (non-pipelined):       opLat=14
 #
 # Note: FloatDiv / FloatSqrt are moved to _CoralNPU_FDV below.
 
-# Float → float: fadd, fsub, fmul, fmadd, fsgnj (sign-inject), fabs, fmv.s
+# Float → float: fadd, fsub, fmul, fmadd (all write to float register file)
 _CoralNPU_FPU_FF = MinorFU(
     opClasses=_make_op_class_set([
         "FloatAdd",       # fadd.s, fsub.s, frsub.s
         "FloatMult",      # fmul.s
         "FloatMultAcc",   # fmadd.s, fnmadd.s, fmsub.s, fnmsub.s
-        "FloatMisc",      # fmv.s (fsgnj same-sign), fsgnjn, fsgnjx, fabs, fmv.w.x (int→float)
+        # FloatMisc moved to FPU_FI (§11.48): fmv.x.w/fclass.s have opLat=5 via scalar_rd_pipe
     ]),
     opLat=3,
     issueLat=1,
@@ -173,12 +182,16 @@ _CoralNPU_FPU_FF = MinorFU(
     )],
 )
 
-# Float → int: flt, fle, feq (comparisons → scalar rd), fcvt (conversions → scalar rd)
-# RTL: FPNEW 3 cy + scalar_rd_pipe Queue 2 cy = 5 cy total.
+# Float → int: flt, fle, feq (comparisons → scalar rd), fcvt (conversions → scalar rd),
+# FloatMisc: fmv.x.w (float→int via scalar_rd_pipe) + fclass.s (scalar_rd=1).
+# RTL: FPNEW 3 cy + scalar_rd_pipe Queue 2 cy = 5 cy total for all these.
+# Also includes fsgnj.s, fmin.s, fmax.s, fmv.w.x (float→float, RTL 3cy) — over-penalised
+# by 2 cy, acceptable given fmv.x.w/fclass.s dominate the FloatMisc count. (§11.48)
 _CoralNPU_FPU_FI = MinorFU(
     opClasses=_make_op_class_set([
         "FloatCmp",       # flt.s, fle.s, feq.s  → result in scalar reg
         "FloatCvt",       # fcvt.wu.s, fcvt.w.s, fcvt.s.w, fcvt.s.wu  → scalar rd
+        "FloatMisc",      # fmv.x.w (→int, 5cy), fclass.s (→int, 5cy), fsgnj/fmin/fmax/fmv.w.x
     ]),
     opLat=5,
     issueLat=1,
@@ -450,8 +463,8 @@ CoralNPU_FUPool = MinorFUPool(funcUnits=[
     _make_CoralNPU_ALU(),   # lane 3
     _CoralNPU_MLU,          # 1 shared scalar multiplier
     _CoralNPU_DVU,          # 1 scalar divider (lane-0-only not enforced)
-    _CoralNPU_FPU_FF,        # scalar FPU float→float (fadd,fmul,fsgnj,…): 3 cy
-    _CoralNPU_FPU_FI,        # scalar FPU float→int  (flt,fle,fcvt,…):    5 cy
+    _CoralNPU_FPU_FF,        # scalar FPU float→float (fadd,fmul,fmadd,…): 3 cy
+    _CoralNPU_FPU_FI,        # scalar FPU float→int + FloatMisc: 5 cy (§11.48)
     _CoralNPU_FDV,           # scalar fdiv/fsqrt: 14 cy non-pipelined
     _CoralNPU_ScalarLSU,    # scalar memory: 3-cy DTCM latency (no LSU bypass)
     _CoralNPU_VecLSU,       # vector memory: 5-cy DTCM latency

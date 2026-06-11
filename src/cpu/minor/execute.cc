@@ -712,6 +712,10 @@ Execute::issue(ThreadID thread_id)
      * this cycle; prevents any further co-issue (RTL Decode.scala:165-169). */
     bool issued_force_slot0_only = false;
 
+    /* §11.49: branchInterlock — RTL Decode.scala:324-327 blocks all
+     * instructions after a conditional branch in the same dispatch group. */
+    bool issued_cond_branch = false;
+
     do {
         MinorDynInstPtr inst = insts_in->insts[thread.inputIndex];
         Fault fault = inst->fault;
@@ -1082,6 +1086,12 @@ Execute::issue(ThreadID thread_id)
                     issued_force_slot0_only = true;
                 }
 
+                /* §11.49: branchInterlock — after a conditional branch,
+                 * block all further co-issue this cycle. */
+                if (inst->staticInst->isCondControl()) {
+                    issued_cond_branch = true;
+                }
+
                 if (num_insts_issued == issueLimit)
                     DPRINTF(MinorExecute, "Reached inst issue limit\n");
             }
@@ -1109,7 +1119,8 @@ Execute::issue(ThreadID thread_id)
         issued && /* We've not yet failed to issue an instruction */
         num_insts_issued != issueLimit && /* Still allowed to issue */
         num_mem_insts_issued != memoryIssueLimit &&
-        !issued_force_slot0_only); /* §11.42: no co-issue after float/CSR */
+        !issued_force_slot0_only && /* §11.42: no co-issue after float/CSR */
+        !issued_cond_branch); /* §11.49: no co-issue after conditional branch */
 
     return num_insts_issued;
 }
@@ -1441,9 +1452,6 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
         bool completed_mem_ref = false;
         bool issued_mem_ref = false;
         bool early_memory_issue = false;
-        bool is_bypass_commit = false;
-        unsigned int bypass_scan_idx = 0;
-
         /* Must set this again to go around the loop */
         completed_inst = false;
 
@@ -1548,9 +1556,7 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                 if (inst->pendingFUDispatch) {
                     /* Instruction accepted to vectorPendingQueue but not yet
                      * dispatched to an FU. If it's from a stale stream,
-                     * discard it; otherwise try to bypass-commit a scalar
-                     * instruction from behind it (RTL scalar-vector
-                     * retirement decoupling). */
+                     * discard it; otherwise stall (§11.49: RTL is in-order). */
                     if (inst->id.streamSeqNum != ex_info.streamSeqNum) {
                         DPRINTF(MinorExecute,
                             "Discarding stale pending vector inst: %s\n",
@@ -1558,139 +1564,9 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
                         try_to_commit = true;
                         completed_inst = true;
                     } else {
-                        /* Scan ahead for a scalar instruction that can
-                         * be committed out-of-order past the pending vector.
-                         * Stop at any memory reference (ordering boundary). */
-                        static constexpr unsigned int bypassScanLimit = 8;
-                        for (unsigned int scan_idx = 1;
-                             scan_idx < bypassScanLimit && !try_to_commit;
-                             scan_idx++)
-                        {
-                            QueuedInst *scanned =
-                                ex_info.inFlightInsts->peekAt(scan_idx);
-                            if (!scanned) break;
-                            MinorDynInstPtr cand = scanned->inst;
-                            if (cand->isBubble()) continue;
-                            /* Skip other pending-dispatch vector insts */
-                            if (cand->pendingFUDispatch) continue;
-                            /* Stop at LSQ ops — memory ordering boundary */
-                            if (cand->inLSQ) break;
-                            /* Skip stale-stream instructions */
-                            if (cand->id.streamSeqNum !=
-                                ex_info.streamSeqNum) continue;
-                            /* Stop at any memory ref */
-                            if (cand->isMemRef()) break;
-                            /* §11.32: Stop at control-flow instructions —
-                             * branches must commit in program order; bypass-
-                             * committing them causes incorrect stream changes */
-                            if (!cand->isFault() &&
-                                cand->staticInst->isControl()) break;
-                            /* Skip vector instructions still in FUs */
-                            if (!cand->isFault() &&
-                                cand->staticInst->isVector()) continue;
-                            /* For regular (non-no-cost) instructions,
-                             * verify the FU has completed execution */
-                            if (cand->fuIndex != noCostFUIndex) {
-                                QueuedInst &fu_inst =
-                                    funcUnits[cand->fuIndex]->front();
-                                if (fu_inst.inst->isBubble()) continue;
-                                if (!(fu_inst.inst->id == cand->id))
-                                    continue;
-                            }
-                            /* Hazard check: bypass of cand past any earlier
-                             * instruction (positions 0..scan_idx-1) is only
-                             * safe if cand is fully independent of all of
-                             * them.  Three hazard types must be blocked:
-                             *  WAR – cand writes a reg that prev reads
-                             *        (prev must see the pre-write value)
-                             *  RAW – cand reads a reg that prev will write
-                             *        (cand would read a stale pre-write
-                             *        value because prev hasn't committed yet)
-                             *  WAW – cand writes a reg that prev also writes
-                             *        (prev's later commit would overwrite
-                             *        cand's result, losing cand's write) */
-                            {
-                                bool hazard = false;
-                                if (cand->isInst()) {
-                                    auto *isa =
-                                        cpu.getContext(thread_id)->getIsaPtr();
-                                    int cand_ns =
-                                        cand->staticInst->numSrcRegs();
-                                    int cand_nd =
-                                        cand->staticInst->numDestRegs();
-                                    for (unsigned int chk = 0;
-                                         chk < scan_idx && !hazard; chk++)
-                                    {
-                                        QueuedInst *prev =
-                                            ex_info.inFlightInsts->peekAt(chk);
-                                        if (!prev) break;
-                                        MinorDynInstPtr pi = prev->inst;
-                                        if (pi->isBubble() || pi->isFault()
-                                            || !pi->isInst()) continue;
-                                        int pi_ns =
-                                            pi->staticInst->numSrcRegs();
-                                        int pi_nd =
-                                            pi->staticInst->numDestRegs();
-                                        /* WAR: cand.dest ∩ prev.src */
-                                        for (int si = 0;
-                                             si < pi_ns && !hazard; si++) {
-                                            RegId psrc =
-                                                pi->staticInst->srcRegIdx(si)
-                                                .flatten(*isa);
-                                            for (int di = 0;
-                                                 di < cand_nd && !hazard; di++) {
-                                                if (psrc ==
-                                                    cand->staticInst
-                                                    ->destRegIdx(di)
-                                                    .flatten(*isa))
-                                                    hazard = true;
-                                            }
-                                        }
-                                        /* RAW: cand.src ∩ prev.dest */
-                                        for (int di = 0;
-                                             di < pi_nd && !hazard; di++) {
-                                            RegId pdst =
-                                                pi->staticInst->destRegIdx(di)
-                                                .flatten(*isa);
-                                            for (int si = 0;
-                                                 si < cand_ns && !hazard; si++) {
-                                                if (pdst ==
-                                                    cand->staticInst
-                                                    ->srcRegIdx(si)
-                                                    .flatten(*isa))
-                                                    hazard = true;
-                                            }
-                                        }
-                                        /* WAW: cand.dest ∩ prev.dest */
-                                        for (int di = 0;
-                                             di < pi_nd && !hazard; di++) {
-                                            RegId pdst =
-                                                pi->staticInst->destRegIdx(di)
-                                                .flatten(*isa);
-                                            for (int cdi = 0;
-                                                 cdi < cand_nd && !hazard;
-                                                 cdi++) {
-                                                if (pdst ==
-                                                    cand->staticInst
-                                                    ->destRegIdx(cdi)
-                                                    .flatten(*isa))
-                                                    hazard = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                if (hazard) continue;
-                            }
-                            DPRINTF(MinorExecute, "Bypass committing"
-                                " scalar inst %s past pending vector"
-                                " head\n", *cand);
-                            inst = cand;
-                            try_to_commit = true;
-                            completed_inst = true;
-                            is_bypass_commit = true;
-                            bypass_scan_idx = scan_idx;
-                        }
-                        /* If no bypassable scalar found, stall */
+                        /* §11.49: RTL RetirementBuffer is in-order; scalar
+                         * cannot commit past a preceding pending vector inst.
+                         * Stall until it dispatches and completes. */
                     }
                 } else {
                     DPRINTF(MinorExecute, "Trying to commit from FUs\n");
@@ -1704,131 +1580,8 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
 
                     if (fu_inst.inst->isBubble()) {
                         /* No instruction at FU output: still in pipeline.
-                         * If the head is a vector instruction, try to
-                         * bypass-commit a scalar from behind it (RTL
-                         * scalar-vector retirement decoupling). */
-                        if (!inst->isFault() && inst->isInst() &&
-                            inst->staticInst->isVector())
-                        {
-                            static constexpr unsigned int bypassScanLimit = 8;
-                            for (unsigned int scan_idx = 1;
-                                 scan_idx < bypassScanLimit && !try_to_commit;
-                                 scan_idx++)
-                            {
-                                QueuedInst *scanned =
-                                    ex_info.inFlightInsts->peekAt(scan_idx);
-                                if (!scanned) break;
-                                MinorDynInstPtr cand = scanned->inst;
-                                if (cand->isBubble()) continue;
-                                if (cand->pendingFUDispatch) continue;
-                                if (cand->inLSQ) break;
-                                if (cand->id.streamSeqNum !=
-                                    ex_info.streamSeqNum) continue;
-                                if (cand->isMemRef()) break;
-                                /* §11.32: Stop at control-flow instructions —
-                                 * branches must commit in program order */
-                                if (!cand->isFault() &&
-                                    cand->staticInst->isControl()) break;
-                                if (!cand->isFault() &&
-                                    cand->staticInst->isVector()) continue;
-                                if (cand->fuIndex != noCostFUIndex) {
-                                    QueuedInst &cand_fu =
-                                        funcUnits[cand->fuIndex]->front();
-                                    if (cand_fu.inst->isBubble()) continue;
-                                    if (!(cand_fu.inst->id == cand->id))
-                                        continue;
-                                }
-                                /* Hazard check (same logic as §11.26 path):
-                                 * WAR + RAW + WAW — cand must be fully
-                                 * independent of all earlier instructions
-                                 * (positions 0..scan_idx-1) before it can
-                                 * be bypass-committed past them. */
-                                {
-                                    bool hazard = false;
-                                    if (cand->isInst()) {
-                                        auto *isa =
-                                            cpu.getContext(thread_id)
-                                            ->getIsaPtr();
-                                        int cand_ns =
-                                            cand->staticInst->numSrcRegs();
-                                        int cand_nd =
-                                            cand->staticInst->numDestRegs();
-                                        for (unsigned int chk = 0;
-                                             chk < scan_idx && !hazard; chk++)
-                                        {
-                                            QueuedInst *prev =
-                                                ex_info.inFlightInsts
-                                                ->peekAt(chk);
-                                            if (!prev) break;
-                                            MinorDynInstPtr pi = prev->inst;
-                                            if (pi->isBubble() || pi->isFault()
-                                                || !pi->isInst()) continue;
-                                            int pi_ns =
-                                                pi->staticInst->numSrcRegs();
-                                            int pi_nd =
-                                                pi->staticInst->numDestRegs();
-                                            /* WAR: cand.dest ∩ prev.src */
-                                            for (int si = 0;
-                                                 si < pi_ns && !hazard; si++) {
-                                                RegId psrc =
-                                                    pi->staticInst->srcRegIdx(si)
-                                                    .flatten(*isa);
-                                                for (int di = 0;
-                                                     di < cand_nd && !hazard;
-                                                     di++) {
-                                                    if (psrc ==
-                                                        cand->staticInst
-                                                        ->destRegIdx(di)
-                                                        .flatten(*isa))
-                                                        hazard = true;
-                                                }
-                                            }
-                                            /* RAW: cand.src ∩ prev.dest */
-                                            for (int di = 0;
-                                                 di < pi_nd && !hazard; di++) {
-                                                RegId pdst =
-                                                    pi->staticInst->destRegIdx(di)
-                                                    .flatten(*isa);
-                                                for (int si = 0;
-                                                     si < cand_ns && !hazard;
-                                                     si++) {
-                                                    if (pdst ==
-                                                        cand->staticInst
-                                                        ->srcRegIdx(si)
-                                                        .flatten(*isa))
-                                                        hazard = true;
-                                                }
-                                            }
-                                            /* WAW: cand.dest ∩ prev.dest */
-                                            for (int di = 0;
-                                                 di < pi_nd && !hazard; di++) {
-                                                RegId pdst =
-                                                    pi->staticInst->destRegIdx(di)
-                                                    .flatten(*isa);
-                                                for (int cdi = 0;
-                                                     cdi < cand_nd && !hazard;
-                                                     cdi++) {
-                                                    if (pdst ==
-                                                        cand->staticInst
-                                                        ->destRegIdx(cdi)
-                                                        .flatten(*isa))
-                                                        hazard = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if (hazard) continue;
-                                }
-                                DPRINTF(MinorExecute, "Bypass committing"
-                                    " scalar inst %s past in-FU vector"
-                                    " head\n", *cand);
-                                inst = cand;
-                                try_to_commit = true;
-                                completed_inst = true;
-                                is_bypass_commit = true;
-                                bypass_scan_idx = scan_idx;
-                            }
-                        }
+                         * §11.49: RTL is in-order; stall until the FU
+                         * completes. No bypass-commit. */
                         if (!try_to_commit)
                             completed_inst = false;
                     } else if (fu_inst_seq_num != head_exec_seq_num) {
@@ -1980,11 +1733,7 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
 
             /* Finished with the inst, remove it from the inst queue and
              *  clear its dependencies */
-            if (is_bypass_commit) {
-                ex_info.inFlightInsts->removeAt(bypass_scan_idx);
-            } else {
-                ex_info.inFlightInsts->pop();
-            }
+            ex_info.inFlightInsts->pop();
 
             /* Complete barriers in the LSQ/move to store buffer */
             if (inst->isInst() && inst->staticInst->isFullMemBarrier()) {
