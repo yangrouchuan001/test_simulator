@@ -4219,3 +4219,226 @@ In three enforcement points, block vector instructions when `cpu.curCycle() <= v
   - Normal issue loop FU scan: new `§11.36` else-if blocking vector issue when vl dirty
   - After successful issue: set `vlTypeDirtyUntil` when SimdConfig issues
   - Deferral `any_capable_fu_free`: add vl dirty guard
+
+---
+
+## 11.37 gem5 30% faster than Verilator — load latency and FPU latency underestimates (conv_28x40x7x10x4_i8xi8xi32)
+
+### Problem
+
+For the `conv_28x40x7x10x4_i8xi8xi32` convolution kernel:
+
+- Verilator: **6,342,989 cycles** (CPI ≈ 1.617)
+- gem5: **4,403,195 cycles** (CPI ≈ 1.12)
+- Gap: **1,939,794 cycles (~30.5% underestimate)**
+
+Function profiling confirmed the gap is concentrated in
+`only_conv_fixed$async_dispatch_0_conv_28x40x7x10x4_i8xi8xi32`:
+
+| Simulator | Cycles in conv function | % of total |
+|-----------|------------------------|------------|
+| Verilator | 5,648,274              | 89.0%      |
+| gem5      | 3,934,878              | 89.4%      |
+
+RTL analysis identified three sources of underestimate:
+
+### Root cause 1 — ScalarLSU: missing load-to-use stall cycle
+
+gem5 had `extraAssumedLat=1` for `_CoralNPU_ScalarLSU`, giving effective load-to-use
+latency of `1 (opLat) + 1 (extra) = 2 cycles`.
+
+RTL analysis of `Decode.scala` revealed that the LSU write port
+(`lsuOffset = instructionLanes + 1`) is a **separate write port that does NOT participate
+in the regfile's same-cycle write-forwarding path**. The result is not visible to a
+dependent instruction until the cycle after the regfile is written, adding 1 extra stall.
+Correct load-to-use latency is 3 cycles.
+
+**Impact on inner MAC loop** (`ede4`–`edfc`, 7 instructions):
+
+```
+ede4: lb  s5, 0(s9)       # T=0  result available T+3
+ede8: lb  a6, 0(s2)       # T=1  result available T+4
+edec: addi s9, s9, 1      # T=2
+edf0: mul  a6, a6, s5     # depends on both loads — stalls until T=4
+edf4: add  t1, a6, t1     # T=7 (mul at MLU opLat=3)
+edf8: addi s2, s2, 1      # T=8
+edfc: bne  s9, t6, ede4   # T=9 → next iter at T=9 (loop body = 9 cy)
+```
+
+With `extraAssumedLat=1` gem5 modelled 8 cycles/iter; the fix makes it 9 cycles/iter.
+With ~314K loop iterations in the inner MAC loop, this alone accounts for
+**~314K extra cycles**.
+
+### Root cause 2 — FPU: float→scalar results ignore scalar_rd_pipe Queue
+
+`FloatCore.scala` line 367:
+```scala
+val scalar_rd_pipe = Queue(scalar_rd_pre_pipe, 2, false)
+```
+
+All float operations whose result goes to a **scalar (integer) register** pass through
+this 2-stage queue after FPNEW completes. This adds 2 extra cycles to any float→int
+instruction (fcvt, flt, fle, feq). The original `_CoralNPU_FPU` had `opLat=3` for all
+float instructions — correct for float→float (fadd, fmul, fsgnj) but 2 cycles too short
+for float→scalar.
+
+The dequantization section of the kernel uses `fcvt.wu.s` and `fcvt.w.s` to convert
+FP32 accumulator results back to integers; each was underestimated by 2 cycles.
+
+### Root cause 3 — FPU: fdiv/fsqrt treated as pipelined
+
+The original `_CoralNPU_FPU` had `opLat=3, issueLat=1` for all float ops including
+`FloatDiv` and `FloatSqrt`. The FPNEW DIVSQRT unit used by CoralNPU is type `MERGED`
+(non-pipelined); for TH32 format / FP32 precision, latency is approximately 14 cycles
+and the unit cannot accept a new instruction until the current one completes
+(`issueLat = opLat = 14`).
+
+### Fix
+
+**Fix A — ScalarLSU extraAssumedLat 1 → 2** (`configs/coralnpu/coralnpu_cpu.py`):
+
+```python
+# Before (§11.36):
+_CoralNPU_ScalarLSU = MinorFU(
+    opClasses=_make_op_class_set([
+        "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
+    ]),
+    opLat=1,
+    issueLat=1,
+    timings=[MinorFUTiming(
+        description="CoralNPU_ScalarLSU",
+        srcRegsRelativeLats=[0],
+        extraAssumedLat=1,
+    )],
+)
+
+# After (§11.37):
+_CoralNPU_ScalarLSU = MinorFU(
+    opClasses=_make_op_class_set([
+        "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
+    ]),
+    opLat=1,
+    issueLat=1,
+    timings=[MinorFUTiming(
+        description="CoralNPU_ScalarLSU",
+        srcRegsRelativeLats=[0],
+        extraAssumedLat=2,    # 1+2 = 3 cy total (RTL: no LSU bypass, regfile WB required)
+    )],
+)
+```
+
+**Fix B — Split `_CoralNPU_FPU` into three specialised FUs** (`configs/coralnpu/coralnpu_cpu.py`):
+
+```python
+# Before (§11.36):
+_CoralNPU_FPU = MinorFU(
+    opClasses=_make_op_class_set([
+        "FloatAdd", "FloatMult", "FloatMultAcc", "FloatMisc",
+        "FloatCmp", "FloatCvt", "FloatDiv", "FloatSqrt",
+    ]),
+    opLat=3,
+    issueLat=1,
+    timings=[MinorFUTiming(description="CoralNPU_FPU", srcRegsRelativeLats=[0, 0])],
+)
+
+# After (§11.37) — three FUs replacing the one:
+
+# Float → float: fadd, fsub, fmul, fmadd, fsgnj, fabs, fmv.w.x
+# FPNEW PipeRegs=3 → result in FP regfile at T+3; no scalar_rd_pipe
+_CoralNPU_FPU_FF = MinorFU(
+    opClasses=_make_op_class_set([
+        "FloatAdd", "FloatMult", "FloatMultAcc", "FloatMisc",
+    ]),
+    opLat=3,
+    issueLat=1,
+    timings=[MinorFUTiming(description="CoralNPU_FPU_FF", srcRegsRelativeLats=[0, 0])],
+)
+
+# Float → int: flt, fle, feq, fcvt
+# FPNEW PipeRegs=3 + scalar_rd_pipe Queue(2) = 5 cy total
+_CoralNPU_FPU_FI = MinorFU(
+    opClasses=_make_op_class_set([
+        "FloatCmp",   # flt.s, fle.s, feq.s → result in scalar reg
+        "FloatCvt",   # fcvt.wu.s, fcvt.w.s → scalar rd
+    ]),
+    opLat=5,
+    issueLat=1,
+    timings=[MinorFUTiming(description="CoralNPU_FPU_FI", srcRegsRelativeLats=[0, 0])],
+)
+
+# Float divide / sqrt — non-pipelined FPNEW MERGED DIVSQRT, TH32 ≈ 14 cy
+_CoralNPU_FDV = MinorFU(
+    opClasses=_make_op_class_set(["FloatDiv", "FloatSqrt"]),
+    opLat=14,
+    issueLat=14,
+    timings=[MinorFUTiming(description="CoralNPU_FDV", srcRegsRelativeLats=[0, 0])],
+)
+```
+
+**Fix C — Update FU pool** (`configs/coralnpu/coralnpu_cpu.py`):
+
+```python
+# Before (§11.36):
+CoralNPU_FUPool = MinorFUPool(funcUnits=[
+    _make_CoralNPU_ALU(),
+    _make_CoralNPU_ALU(),
+    _make_CoralNPU_ALU(),
+    _make_CoralNPU_ALU(),
+    _CoralNPU_MLU,
+    _CoralNPU_DVU,
+    _CoralNPU_FPU,              # single FPU object
+    _CoralNPU_ScalarLSU,
+    ...
+])
+
+# After (§11.37):
+CoralNPU_FUPool = MinorFUPool(funcUnits=[
+    _make_CoralNPU_ALU(),   # lane 0
+    _make_CoralNPU_ALU(),   # lane 1
+    _make_CoralNPU_ALU(),   # lane 2
+    _make_CoralNPU_ALU(),   # lane 3
+    _CoralNPU_MLU,
+    _CoralNPU_DVU,
+    _CoralNPU_FPU_FF,       # scalar FPU float→float: 3 cy
+    _CoralNPU_FPU_FI,       # scalar FPU float→int:   5 cy
+    _CoralNPU_FDV,          # scalar fdiv/fsqrt: 14 cy non-pipelined
+    _CoralNPU_ScalarLSU,    # scalar memory: 3-cy DTCM latency (no LSU bypass)
+    _CoralNPU_VecLSU,
+    _CoralNPU_CSR,
+    _make_CoralNPU_VEC_ALU(),
+    _make_CoralNPU_VEC_ALU(),
+    _make_CoralNPU_VEC_MUL(),
+    _make_CoralNPU_VEC_MUL(),
+    _make_CoralNPU_VEC_PMTRDT(),
+    _CoralNPU_VEC_DIV,
+])
+```
+
+### RTL evidence
+
+| Claim | RTL source |
+|-------|-----------|
+| LSU write port has no forwarding | `Decode.scala`: `lsuOffset = instructionLanes+1`; RAW stall scoreboard is separate `regd` from ALU/MLU forwarding path |
+| scalar_rd_pipe adds 2 cycles | `FloatCore.scala:367`: `Queue(scalar_rd_pre_pipe, 2, false)` |
+| FPNEW PipeRegs=3 for all units | `FloatCore.scala` FPNEW instantiation: `PipeRegs=3` in all unit configs |
+| DIVSQRT is MERGED (non-pipelined) | FPNEW library: `DIVSQRT_TYPE = MERGED`; latency ≈ 14 cy for FP32 TH32 format |
+| MLU result uses forwarding (opLat=3 correct) | `Mlu.scala`: 2 pipeline reg stages + same-cycle write-forwarding → consumer dispatches at T+3 |
+
+### Estimated impact
+
+| Fix | Mechanism | Estimated cycles saved |
+|-----|-----------|----------------------|
+| extraAssumedLat 1→2 | +1 stall/iter × ~314K inner MAC iters | ~314K |
+| FloatCvt/FloatCmp opLat 3→5 | +2 cy per fcvt/flt in dequant section | ~150–200K |
+| FloatDiv issueLat 1→14 | fdiv serialisation in dequant section | ~100–150K |
+| **Total estimated** | | **~560–670K** |
+
+Remaining gap of ~1.27M cycles is attributed to unmodelled structural hazards, vector
+instruction overhead, and additional load-use stalls in non-MAC code sections.
+
+### Files changed
+
+- `configs/coralnpu/coralnpu_cpu.py`:
+  - `_CoralNPU_ScalarLSU`: `extraAssumedLat=1` → `extraAssumedLat=2`
+  - `_CoralNPU_FPU` replaced by `_CoralNPU_FPU_FF` (opLat=3), `_CoralNPU_FPU_FI` (opLat=5), `_CoralNPU_FDV` (opLat=14, issueLat=14)
+  - `CoralNPU_FUPool`: updated to reference the three new FU objects

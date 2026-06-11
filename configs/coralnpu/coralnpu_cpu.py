@@ -16,8 +16,10 @@
 #     ALU  × 4   latency=1  II=1  (one per dispatch lane)
 #     MLU  × 1   latency=3  II=1  (pipelined shared multiplier)
 #     DVU  × 1   latency=34 II=34 (non-pipelined divider, lane-0 only in HW)
-#     FPU  × 1   latency=3  II=1  (pipelined, slot-0 only in HW)
-#     ScalarLSU × 1  latency=1  extraAssumedLat=1  (2cy total; RTL: 1addr+1SRAM)
+#     FPU_FF × 1  latency=3  II=1  (float→float: fadd,fmul,fsgnj,fabs; FPNEW 3cy)
+#     FPU_FI × 1  latency=5  II=1  (float→int: flt,fle,fcvt; FPNEW 3cy + Queue 2cy)
+#     FDV    × 1  latency=14 II=14 (fdiv/fsqrt; non-pipelined FPNEW TH32)
+#     ScalarLSU × 1  latency=1  extraAssumedLat=2  (3cy total; no LSU bypass in RTL)
 #     VecLSU    × 1  latency=1  extraAssumedLat=4  (5cy total; RTL: 3ovhd+2EX)
 #     CSR  × 1   latency=1  serialising
 #
@@ -115,17 +117,59 @@ _CoralNPU_DVU = MinorFU(
 )
 
 # FPU — 1 pipelined floating-point unit (slot 0 only in HW).
-# CoralNPU latency = 3 cycles (E1=setup, E2=mantissa multiply, E3=round).
-# II = 1.
-_CoralNPU_FPU = MinorFU(
+#
+# RTL (FloatCore.scala): wraps FPNEW with PipeRegs=3 for all units.
+# Operations that write to a SCALAR (integer) register also pass through
+# a 2-stage Queue (scalar_rd_pipe, FloatCore.scala:367), adding 2 cy.
+#
+#   Float → float result (fadd, fmul, fsgnj, fabs, …): 3 cy (FPNEW only)
+#   Float → int   result (flt, fle, feq, fclass):      5 cy (FPNEW 3 + Queue 2)
+#   Float → int   result (fcvt F2I, fcvt W2F as I2F):  5 cy (FPNEW 3 + Queue 2)
+#   fmv.x.w (FloatMisc → int):                         3 cy (FPNEW 1 + Queue 2)
+#
+# Two FU objects are used so gem5 can apply the correct opLat per class:
+#   _CoralNPU_FPU_FF : float-to-float ops  (opLat=3)
+#   _CoralNPU_FPU_FI : float-to-int  ops  (opLat=5)
+#   _CoralNPU_FDV    : fdiv / fsqrt        (opLat=14, issueLat=14, non-pipelined)
+#
+# Note: FloatDiv / FloatSqrt are moved to _CoralNPU_FDV below.
+
+# Float → float: fadd, fsub, fmul, fmadd, fsgnj (sign-inject), fabs, fmv.s
+_CoralNPU_FPU_FF = MinorFU(
     opClasses=_make_op_class_set([
-        "FloatAdd", "FloatCmp", "FloatCvt",
-        "FloatMult", "FloatMultAcc",
-        "FloatDiv", "FloatSqrt", "FloatMisc",
+        "FloatAdd",       # fadd.s, fsub.s, frsub.s
+        "FloatMult",      # fmul.s
+        "FloatMultAcc",   # fmadd.s, fnmadd.s, fmsub.s, fnmsub.s
+        "FloatMisc",      # fmv.s (fsgnj same-sign), fsgnjn, fsgnjx, fabs, fmv.w.x (int→float)
     ]),
     opLat=3,
     issueLat=1,
-    timings=[MinorFUTiming(description="CoralNPU_FPU", srcRegsRelativeLats=[0, 0])],
+    timings=[MinorFUTiming(description="CoralNPU_FPU_FF", srcRegsRelativeLats=[0, 0])],
+)
+
+# Float → int: flt, fle, feq (comparisons → scalar rd), fcvt (conversions → scalar rd)
+# RTL: FPNEW 3 cy + scalar_rd_pipe Queue 2 cy = 5 cy total.
+_CoralNPU_FPU_FI = MinorFU(
+    opClasses=_make_op_class_set([
+        "FloatCmp",       # flt.s, fle.s, feq.s  → result in scalar reg
+        "FloatCvt",       # fcvt.wu.s, fcvt.w.s, fcvt.s.w, fcvt.s.wu  → scalar rd
+    ]),
+    opLat=5,
+    issueLat=1,
+    timings=[MinorFUTiming(description="CoralNPU_FPU_FI", srcRegsRelativeLats=[0, 0])],
+)
+
+# Float divide / sqrt — non-pipelined FPNEW MERGED DIVSQRT unit.
+# RTL: TH32 FP32 divider ≈ 11–14 cycles iterative + 3 FPNEW PipeRegs ≈ 14 cy.
+# issueLat=14: new divide cannot enter until current finishes (non-pipelined II).
+_CoralNPU_FDV = MinorFU(
+    opClasses=_make_op_class_set([
+        "FloatDiv",       # fdiv.s
+        "FloatSqrt",      # fsqrt.s
+    ]),
+    opLat=14,
+    issueLat=14,
+    timings=[MinorFUTiming(description="CoralNPU_FDV", srcRegsRelativeLats=[0, 0])],
 )
 
 # CSR / System — serialising instructions (csrrw/csrrs/csrrc/fence/wfi/…).
@@ -143,8 +187,8 @@ _CoralNPU_CSR = MinorFU(
 #
 # RTL latency (pipeline_and_instructions.md):
 #
-#   Scalar DTCM load:  2 cy  (E1: address calc; E2: SRAM response)
-#     → opLat=1 + extraAssumedLat=1 = 2 cy total
+#   Scalar DTCM load:  3 cy effective (E1: addr; E2: SRAM; no LSU bypass → +1 stall)
+#     → opLat=1 + extraAssumedLat=2 = 3 cy total
 #
 #   Vector DTCM load:  3 cy overhead (DE2-FF + ROB-FF + VRF-FF)
 #                    + ceil(vl × EEW_bytes / 32) × (1 + memory_cycles)
@@ -156,7 +200,18 @@ _CoralNPU_CSR = MinorFU(
 # independent FU pool slots; having two separate entries lets the
 # scoreboard apply the correct latency to each class.
 
-# Scalar LSU — 2-cycle DTCM latency (1 addr + 1 SRAM).
+# Scalar LSU — 3-cycle effective load-to-use latency.
+#
+# RTL (Decode.scala): the LSU write port (lsuOffset = instructionLanes+1) does
+# NOT participate in the regfile's same-cycle write-forwarding path.  A load
+# result is written to the regfile at the end of the SRAM access cycle (T+2)
+# but a dependent consumer cannot read the new value until the following cycle
+# (T+3) and therefore dispatches one cycle later than gem5's old 2-cy model.
+#
+#   E1 addr calc  : T+1
+#   E2 SRAM       : T+2  (data written to regfile at T+2, no bypass)
+#   consumer reads: T+3  → consumer executes at T+3
+#   gem5 model    : opLat=1 + extraAssumedLat=2 = 3 cy total
 _CoralNPU_ScalarLSU = MinorFU(
     opClasses=_make_op_class_set([
         "MemRead", "MemWrite", "FloatMemRead", "FloatMemWrite",
@@ -166,7 +221,7 @@ _CoralNPU_ScalarLSU = MinorFU(
     timings=[MinorFUTiming(
         description="CoralNPU_ScalarLSU",
         srcRegsRelativeLats=[0],
-        extraAssumedLat=1,    # 1+1 = 2 cy total  (RTL: 2 cy)
+        extraAssumedLat=2,    # 1+2 = 3 cy total  (RTL: no LSU bypass, regfile WB required)
     )],
 )
 
@@ -356,8 +411,10 @@ CoralNPU_FUPool = MinorFUPool(funcUnits=[
     _make_CoralNPU_ALU(),   # lane 3
     _CoralNPU_MLU,          # 1 shared scalar multiplier
     _CoralNPU_DVU,          # 1 scalar divider (lane-0-only not enforced)
-    _CoralNPU_FPU,          # 1 scalar FPU (slot-0-only not enforced)
-    _CoralNPU_ScalarLSU,    # scalar memory: 2-cy DTCM latency
+    _CoralNPU_FPU_FF,        # scalar FPU float→float (fadd,fmul,fsgnj,…): 3 cy
+    _CoralNPU_FPU_FI,        # scalar FPU float→int  (flt,fle,fcvt,…):    5 cy
+    _CoralNPU_FDV,           # scalar fdiv/fsqrt: 14 cy non-pipelined
+    _CoralNPU_ScalarLSU,    # scalar memory: 3-cy DTCM latency (no LSU bypass)
     _CoralNPU_VecLSU,       # vector memory: 5-cy DTCM latency
     _CoralNPU_CSR,          # System / CSR / serialising
     # ── RVV co-processor units ──────────────────────────────────────────────
